@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+.env.*
+service_account.json
+*-credentials.json
+*-cred*.json
+
+# Generated outputs
+*.xlsx
+*.csv
+
+# Captured network traffic (large)
+*.har
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

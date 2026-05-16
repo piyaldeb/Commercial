@@ -1,0 +1,7 @@
+requests
+pandas
+gspread
+gspread-dataframe
+google-auth
+python-dotenv
+openpyxl

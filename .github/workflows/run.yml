@@ -1,0 +1,44 @@
+name: Partial Deliveries Monthly
+
+on:
+  schedule:
+    # Every day at 02:00 UTC (08:00 Asia/Dhaka)
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run combine_invoice.py
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
+          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
+          GOOGLE_SHEET_CRED_JSON: ${{ secrets.GOOGLE_SHEET_CRED_JSON }}
+        run: python combine_invoice.py
+
+      - name: Upload generated workbook
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: partial-deliveries-monthly
+          path: "Partial Deliveries Monthly - *.xlsx"
+          if-no-files-found: ignore
