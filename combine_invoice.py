@@ -569,11 +569,10 @@ if __name__ == "__main__":
     if not switch_company(company_id):
         sys.exit(1)
 
-    # Fetch invoices from a wide back-window so we don't miss older invoices
-    # whose partial deliveries land in the current month (e.g. TZBD/2025-26/xxx).
-    # The month-filter happens later when we keep only rows with activity in the
-    # current month's workdays.
-    REPORT_FROM = date(2025, 1, 1)
+    # Fetch invoices with invoice_date >= 2026-04-01.
+    # The month-filter happens later when we keep only rows with partial-delivery
+    # activity in the current month's Sun-Thu workdays.
+    REPORT_FROM = date(2026, 4, 1)
 
     invoices = fetch_combine_invoices(allowed, invoice_date_from=REPORT_FROM.isoformat())
     print(f"✅ {len(invoices)} combine invoices fetched (since {REPORT_FROM})")
