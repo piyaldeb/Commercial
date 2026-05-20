@@ -135,6 +135,7 @@ def fetch_delivery_ops():
     }
     spec = {
         "oa_id":       {"fields": {"display_name": {}}},
+        "partner_id":  {"fields": {"display_name": {}}},
         "action_date": {},
         "fg_balance":  {},
         "final_price": {},
@@ -197,6 +198,7 @@ def build_rows(ops):
         if not oa_id:
             continue
         comp = (op.get("company_id") or {}).get("id")
+        customer = (op.get("partner_id") or {}).get("display_name", "")
         ad = op.get("action_date")
         if not ad:
             continue
@@ -224,8 +226,9 @@ def build_rows(ops):
         if key not in agg:
             agg[key] = {
                 "OA": oa.get("display_name") or "",
-                "Company": COMPANY_LABEL.get(comp, ""),
+                "Customer": customer,
                 "Total Value": 0.0,
+                "Company": COMPANY_LABEL.get(comp, ""),
             }
             for label, _, _ in BUCKETS:
                 agg[key][label] = 0.0
@@ -240,10 +243,11 @@ def build_rows(ops):
 
 
 def push_to_sheet(rows):
-    cols = ["OA", "Company"] + [b[0] for b in BUCKETS] + ["Total Value"]
+    cols = ["OA", "Customer"] + [b[0] for b in BUCKETS] + ["Total Value", "Company"]
     df = pd.DataFrame(rows, columns=cols)
-    # Round to integers for readability — dashboard shows whole numbers
-    for c in cols[2:]:
+    # Round numeric columns to integers for readability
+    numeric_cols = [b[0] for b in BUCKETS] + ["Total Value"]
+    for c in numeric_cols:
         df[c] = df[c].round(0)
 
     client = get_gspread_client()
