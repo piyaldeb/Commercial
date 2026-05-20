@@ -1,18 +1,27 @@
 """
-Pull every OA listed under the Payment Terms section of the FG Stock Dashboard
-and write a flat OA list to the 'FG store-Agieng Wise' worksheet on Google Sheets.
+Per-OA aging-bucket VALUE report for the FG Stock Dashboard.
 
-Calls fg.stock.dashboard.get_drilldown_data once per payment-term bucket
-(same call the Odoo web UI makes when you click a value).
+Pulls operation.details rows that match the FG dashboard domain
+(next_operation=Delivery, state not in done/closed), buckets each line's
+value (qty * final_price) by (today - action_date) into 11 aging buckets,
+and writes a flat table to the 'FG store-Agieng Wise' Google Sheets tab.
+
+Output columns:
+  OA, Company, 0-5 Days, 6-10 Days, 11-15 Days, 16-20 Days, 21-25 Days,
+  26-30 Days, 30-60 Days, 61-90 Days, 91-120 Days, 120-180 Days, 180+ Days,
+  Total Value
 """
 
 import os
 import sys
 import json
+import time
 import base64
 import logging
+from datetime import date, datetime
 
 import requests
+from requests.exceptions import RequestException
 import pandas as pd
 import gspread
 from gspread_dataframe import set_with_dataframe
@@ -34,91 +43,65 @@ PASSWORD = os.getenv("ODOO_PASSWORD")
 SHEET_KEY = "1coN06mZ9uLBn1JnSyNqLwYhpl2-fJsuT85xwuNI0iy8"
 WORKSHEET_NAME = "FG store-Agieng Wise"
 
-# Same filter the browser sent in the HAR.
-DASHBOARD_FILTER = {
-    "company_id": "all",
-    "salesperson_id": None,
-    "team_id": None,
-    "company_ids": [1, 3],
-}
-ALLOWED_COMPANY_IDS = [1, 4, 3]
-METRIC = "Total_Value"
+COMPANY_LABEL = {1: "Zipper", 3: "Metal Trims"}
+ALLOWED = [3, 2, 1]
+ACTIVE_COMPANY = 3
+
+BUCKETS = [
+    ("0-5 Days",     0,   5),
+    ("6-10 Days",    6,   10),
+    ("11-15 Days",   11,  15),
+    ("16-20 Days",   16,  20),
+    ("21-25 Days",   21,  25),
+    ("26-30 Days",   26,  30),
+    ("30-60 Days",   30,  60),
+    ("61-90 Days",   61,  90),
+    ("91-120 Days",  91,  120),
+    ("120-180 Days", 120, 180),
+    ("180+ Days",    181, 10**9),
+]
 
 session = requests.Session()
+USER_ID = None
 
 
-def jsonrpc(model: str, method: str, args, kwargs=None) -> dict:
+def retry_request(method, url, max_retries=3, backoff=3, **kwargs):
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = method(url, **kwargs)
+            r.raise_for_status()
+            return r
+        except RequestException as e:
+            log.info(f"Attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(backoff)
+            else:
+                raise
+
+
+def login():
+    global USER_ID
+    payload = {"jsonrpc": "2.0", "params": {"db": DB, "login": USERNAME, "password": PASSWORD}}
+    r = retry_request(session.post, f"{ODOO_URL}/web/session/authenticate", json=payload)
+    result = r.json().get("result") or {}
+    if "uid" not in result:
+        raise Exception("Login failed")
+    USER_ID = result["uid"]
+    log.info(f"Logged in (uid={USER_ID})")
+
+
+def switch_company(company_id):
     payload = {
-        "jsonrpc": "2.0",
-        "method": "call",
+        "jsonrpc": "2.0", "method": "call",
         "params": {
-            "model": model,
-            "method": method,
-            "args": args,
-            "kwargs": kwargs or {},
+            "model": "res.users", "method": "write",
+            "args": [[USER_ID], {"company_id": company_id}],
+            "kwargs": {"context": {"allowed_company_ids": [company_id], "company_id": company_id}},
         },
     }
-    r = session.post(
-        f"{ODOO_URL}/web/dataset/call_kw/{model}/{method}",
-        json=payload,
-        timeout=120,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if "error" in data:
-        raise RuntimeError(json.dumps(data["error"], indent=2))
-    return data["result"]
-
-
-def authenticate():
-    r = session.post(
-        f"{ODOO_URL}/web/session/authenticate",
-        json={
-            "jsonrpc": "2.0",
-            "params": {"db": DB, "login": USERNAME, "password": PASSWORD},
-        },
-        timeout=60,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if "error" in data:
-        raise RuntimeError(json.dumps(data["error"], indent=2))
-    uid = (data.get("result") or {}).get("uid")
-    if not uid:
-        raise RuntimeError("Authentication failed (no uid in response)")
-    log.info(f"Authenticated as uid={uid}")
-    return uid
-
-
-def get_payment_terms() -> list[str]:
-    ctx = {
-        "lang": "en_US",
-        "tz": "Asia/Dhaka",
-        "allowed_company_ids": ALLOWED_COMPANY_IDS,
-    }
-    res = jsonrpc(
-        "fg.stock.dashboard",
-        "get_dashboard_data",
-        [DASHBOARD_FILTER],
-        {"context": ctx},
-    )
-    terms = [row["Payment Terms"] for row in res.get("payment_terms", [])]
-    log.info(f"Found {len(terms)} payment-term buckets on dashboard")
-    return terms
-
-
-def get_drilldown_oas(term: str) -> list[dict]:
-    ctx = {
-        "lang": "en_US",
-        "tz": "Asia/Dhaka",
-        "allowed_company_ids": ALLOWED_COMPANY_IDS,
-    }
-    return jsonrpc(
-        "fg.stock.dashboard",
-        "get_drilldown_data",
-        [DASHBOARD_FILTER, "payment_terms", term, METRIC],
-        {"context": ctx},
-    ) or []
+    r = retry_request(session.post, f"{ODOO_URL}/web/dataset/call_kw", json=payload)
+    if "error" in r.json():
+        raise Exception(f"switch_company failed: {r.json()['error']}")
 
 
 def get_gspread_client():
@@ -144,39 +127,162 @@ def get_gspread_client():
     raise Exception("No Google credentials found.")
 
 
-def main():
-    if not all([ODOO_URL, DB, USERNAME, PASSWORD]):
-        raise SystemExit("Missing ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_PASSWORD in .env")
+def fetch_delivery_ops():
+    ctx = {
+        "lang": "en_US", "tz": "Asia/Dhaka", "uid": USER_ID,
+        "allowed_company_ids": ALLOWED, "bin_size": True,
+        "current_company_id": ACTIVE_COMPANY,
+    }
+    spec = {
+        "oa_id":       {"fields": {"display_name": {}}},
+        "action_date": {},
+        "fg_balance":  {},
+        "final_price": {},
+        "company_id":  {"fields": {}},
+    }
+    # Same scope as the FG Stock Dashboard: lines awaiting FG Packing with
+    # remaining stock balance, not yet shipped.
+    domain = [
+        ["next_operation", "=", "FG Packing"],
+        ["fg_balance", ">", 0],
+        ["state", "in", ["waiting", "partial"]],
+    ]
+    out = []
+    offset = 0
+    page = 5000
+    while True:
+        payload = {
+            "jsonrpc": "2.0", "method": "call",
+            "params": {
+                "model": "operation.details", "method": "web_search_read",
+                "args": [],
+                "kwargs": {
+                    "specification": spec, "offset": offset, "order": "id ASC",
+                    "limit": page, "context": ctx, "count_limit": 1000001,
+                    "domain": domain,
+                },
+            },
+        }
+        r = retry_request(
+            session.post,
+            f"{ODOO_URL}/web/dataset/call_kw/operation.details/web_search_read",
+            json=payload,
+        )
+        body = r.json()
+        if "error" in body:
+            raise Exception(f"operation.details fetch failed: {body['error']}")
+        recs = body.get("result", {}).get("records", [])
+        out.extend(recs)
+        log.info(f"operation.details: fetched {len(recs)} (total {len(out)})")
+        if len(recs) < page:
+            break
+        offset += page
+    return out
 
-    authenticate()
-    terms = get_payment_terms()
 
-    all_rows = []
-    for term in terms:
-        rows = get_drilldown_oas(term)
-        log.info(f"  {term}: {len(rows)} OAs")
-        for row in rows:
-            all_rows.append({
-                "Payment Term": term,
-                "OA": row.get("OA", ""),
-                "Category": row.get("Category", ""),
-                "Value": row.get("Value", 0),
-            })
+def bucket_for_age(age_days):
+    for label, lo, hi in BUCKETS:
+        if lo <= age_days <= hi:
+            return label
+    return BUCKETS[-1][0]
 
-    df = pd.DataFrame(all_rows, columns=["Payment Term", "OA", "Category", "Value"])
-    distinct = df["OA"].nunique()
-    log.info(f"Total drilldown rows: {len(df)}; distinct OAs: {distinct}; sum Value: {df['Value'].sum():,.0f}")
 
-    log.info(f"Writing to Google Sheets: {WORKSHEET_NAME}")
+def build_rows(ops):
+    today = date.today()
+    agg = {}  # (oa_id, company_id) -> dict
+
+    for op in ops:
+        oa = op.get("oa_id") or {}
+        oa_id = oa.get("id")
+        if not oa_id:
+            continue
+        comp = (op.get("company_id") or {}).get("id")
+        ad = op.get("action_date")
+        if not ad:
+            continue
+        try:
+            ad_dt = datetime.strptime(ad, "%Y-%m-%d %H:%M:%S").date()
+        except Exception:
+            try:
+                ad_dt = pd.to_datetime(ad).date()
+            except Exception:
+                continue
+        age = max((today - ad_dt).days, 0)
+        bucket = bucket_for_age(age)
+
+        try:
+            balance = float(op.get("fg_balance") or 0)
+        except Exception:
+            balance = 0.0
+        try:
+            price = float(op.get("final_price") or 0)
+        except Exception:
+            price = 0.0
+        value = balance * price
+
+        key = (oa_id, comp)
+        if key not in agg:
+            agg[key] = {
+                "OA": oa.get("display_name") or "",
+                "Company": COMPANY_LABEL.get(comp, ""),
+                "Total Value": 0.0,
+            }
+            for label, _, _ in BUCKETS:
+                agg[key][label] = 0.0
+
+        row = agg[key]
+        row["Total Value"] += value
+        row[bucket] += value
+
+    rows = list(agg.values())
+    rows.sort(key=lambda r: (-r["Total Value"], r["OA"]))
+    return rows
+
+
+def push_to_sheet(rows):
+    cols = ["OA", "Company"] + [b[0] for b in BUCKETS] + ["Total Value"]
+    df = pd.DataFrame(rows, columns=cols)
+    # Round to integers for readability — dashboard shows whole numbers
+    for c in cols[2:]:
+        df[c] = df[c].round(0)
+
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_KEY)
     try:
         ws = sheet.worksheet(WORKSHEET_NAME)
-        ws.clear()
     except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=WORKSHEET_NAME, rows=max(len(df) + 10, 100), cols=10)
-    set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
-    log.info("Done.")
+        ws = sheet.add_worksheet(
+            title=WORKSHEET_NAME,
+            rows=max(1000, len(df) + 50),
+            cols=max(20, len(df.columns) + 5),
+        )
+    ws.clear()
+    set_with_dataframe(ws, df)
+    log.info(f"Pasted {len(df)} rows to '{WORKSHEET_NAME}'")
+
+
+def main():
+    if not all([ODOO_URL, DB, USERNAME, PASSWORD]):
+        raise SystemExit("Missing ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_PASSWORD in .env")
+
+    login()
+    switch_company(ACTIVE_COMPANY)
+
+    ops = fetch_delivery_ops()
+    log.info(f"{len(ops)} delivery operation lines fetched")
+
+    rows = build_rows(ops)
+    distinct_oas = len({r["OA"] for r in rows})
+    total_value = sum(r["Total Value"] for r in rows)
+    log.info(f"Built {len(rows)} (OA, company) rows; distinct OAs={distinct_oas}; total value={total_value:,.0f}")
+
+    if os.getenv("FG_DASHBOARD_DRY_RUN"):
+        log.info("\n--- DRY RUN: first 3 rows ---")
+        for r in rows[:3]:
+            log.info(json.dumps(r, indent=2, default=str))
+        return
+
+    push_to_sheet(rows)
 
 
 if __name__ == "__main__":
