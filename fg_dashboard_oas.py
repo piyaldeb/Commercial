@@ -181,6 +181,56 @@ def fetch_delivery_ops():
     return out
 
 
+def fetch_oa_teams(oa_ids):
+    """oa_id on operation.details points to sale.order. Pull team_id name
+    for each OA in batched paginated calls."""
+    if not oa_ids:
+        return {}
+    ctx = {
+        "lang": "en_US", "tz": "Asia/Dhaka", "uid": USER_ID,
+        "allowed_company_ids": ALLOWED, "bin_size": True,
+        "current_company_id": ACTIVE_COMPANY,
+    }
+    spec = {"team_id": {"fields": {"display_name": {}}}}
+    out = {}
+    ids = list(set(oa_ids))
+    CHUNK = 500
+    for i in range(0, len(ids), CHUNK):
+        chunk = ids[i:i + CHUNK]
+        offset = 0
+        page = 5000
+        while True:
+            payload = {
+                "jsonrpc": "2.0", "method": "call",
+                "params": {
+                    "model": "sale.order", "method": "web_search_read",
+                    "args": [],
+                    "kwargs": {
+                        "specification": spec, "offset": offset, "order": "id ASC",
+                        "limit": page, "context": ctx, "count_limit": 100001,
+                        "domain": [["id", "in", chunk]],
+                    },
+                },
+            }
+            r = retry_request(
+                session.post,
+                f"{ODOO_URL}/web/dataset/call_kw/sale.order/web_search_read",
+                json=payload,
+            )
+            body = r.json()
+            if "error" in body:
+                raise Exception(f"sale.order fetch failed: {body['error']}")
+            recs = body.get("result", {}).get("records", [])
+            for rec in recs:
+                t = rec.get("team_id") or {}
+                out[rec["id"]] = t.get("display_name") or ""
+            if len(recs) < page:
+                break
+            offset += page
+    log.info(f"sale.order team lookup: {len(out)} OAs")
+    return out
+
+
 def bucket_for_age(age_days):
     for label, lo, hi in BUCKETS:
         if lo <= age_days <= hi:
@@ -188,7 +238,7 @@ def bucket_for_age(age_days):
     return BUCKETS[-1][0]
 
 
-def build_rows(ops):
+def build_rows(ops, oa_to_team):
     today = date.today()
     agg = {}  # (oa_id, company_id) -> dict
 
@@ -227,6 +277,7 @@ def build_rows(ops):
             agg[key] = {
                 "OA": oa.get("display_name") or "",
                 "Customer": customer,
+                "Team": oa_to_team.get(oa_id, ""),
                 "Total Value": 0.0,
                 "Company": COMPANY_LABEL.get(comp, ""),
             }
@@ -243,7 +294,7 @@ def build_rows(ops):
 
 
 def push_to_sheet(rows):
-    cols = ["OA", "Customer"] + [b[0] for b in BUCKETS] + ["Total Value", "Company"]
+    cols = ["OA", "Customer", "Team"] + [b[0] for b in BUCKETS] + ["Total Value", "Company"]
     df = pd.DataFrame(rows, columns=cols)
     # Round numeric columns to integers for readability
     numeric_cols = [b[0] for b in BUCKETS] + ["Total Value"]
@@ -275,7 +326,11 @@ def main():
     ops = fetch_delivery_ops()
     log.info(f"{len(ops)} delivery operation lines fetched")
 
-    rows = build_rows(ops)
+    oa_ids = sorted({(op.get("oa_id") or {}).get("id")
+                     for op in ops if (op.get("oa_id") or {}).get("id")})
+    oa_to_team = fetch_oa_teams(oa_ids)
+
+    rows = build_rows(ops, oa_to_team)
     distinct_oas = len({r["OA"] for r in rows})
     total_value = sum(r["Total Value"] for r in rows)
     log.info(f"Built {len(rows)} (OA, company) rows; distinct OAs={distinct_oas}; total value={total_value:,.0f}")
