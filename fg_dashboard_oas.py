@@ -301,6 +301,11 @@ def push_to_sheet(rows):
     for c in numeric_cols:
         df[c] = df[c].round(0)
 
+    # Sheet has a dashboard in rows 1-12; OA table starts at row 13.
+    # Headers already exist on row 13, so paste data only from row 14 onward.
+    START_ROW = 14
+    HEADER_ROW = 13
+
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_KEY)
     try:
@@ -308,12 +313,27 @@ def push_to_sheet(rows):
     except gspread.WorksheetNotFound:
         ws = sheet.add_worksheet(
             title=WORKSHEET_NAME,
-            rows=max(1000, len(df) + 50),
+            rows=max(1000, START_ROW + len(df) + 50),
             cols=max(20, len(df.columns) + 5),
         )
-    ws.clear()
-    set_with_dataframe(ws, df)
-    log.info(f"Pasted {len(df)} rows to '{WORKSHEET_NAME}'")
+
+    # Make sure the sheet has enough rows for the new data.
+    needed_rows = START_ROW + len(df) - 1
+    if ws.row_count < needed_rows:
+        ws.add_rows(needed_rows - ws.row_count)
+
+    # Clear row 13 downward (keep rows 1-12 untouched).
+    last_col_letter = gspread.utils.rowcol_to_a1(1, ws.col_count).rstrip("1")
+    ws.batch_clear([f"A{HEADER_ROW}:{last_col_letter}{ws.row_count}"])
+
+    set_with_dataframe(
+        ws, df,
+        row=START_ROW, col=1,
+        include_index=False,
+        include_column_header=False,
+        resize=False,
+    )
+    log.info(f"Pasted {len(df)} rows to '{WORKSHEET_NAME}' starting at row {START_ROW}")
 
 
 def main():
