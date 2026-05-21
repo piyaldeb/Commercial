@@ -31,6 +31,8 @@ PASSWORD = os.getenv("ODOO_PASSWORD")
 
 SHEET_KEY = "1coN06mZ9uLBn1JnSyNqLwYhpl2-fJsuT85xwuNI0iy8"
 WORKSHEET_NAME = "Raw"
+DUMP_WORKSHEET_NAME = "Dump"
+DUMP_MONTHS = 3
 
 today = date.today()
 
@@ -557,6 +559,53 @@ def write_partial_deliveries_xlsx(rows, weeks, month_start, out_path):
     wb.save(out_path)
     return out_path
 
+# ========= LAST-N-MONTHS HELPERS =========
+def last_n_month_starts(anchor, n):
+    """Return [oldest, ..., anchor's month start] for the last n calendar months."""
+    starts = []
+    y, m = anchor.year, anchor.month
+    for _ in range(n):
+        starts.append(date(y, m, 1))
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return list(reversed(starts))
+
+
+def build_dump_rows(invoices, invoice_lines, ops, month_starts):
+    """
+    Produce long-format rows for the Dump sheet across multiple months.
+
+    Columns:
+        Month, Invoice No, Invoice Date, Customer, Full Qty Delivery Date,
+        Invoice Value, Invoice QTY, Date, Value
+    One output row per (invoice, day) that has a non-zero partial-delivery value
+    within that month's Sun-Thu workdays.
+    """
+    out = []
+    for ms in month_starts:
+        rows, weeks = build_report(invoices, invoice_lines, ops, ms)
+        all_days = {d for wk in weeks for d in wk}
+        month_label = ms.strftime("%b%y")  # e.g. "May26"
+        for r in rows:
+            for d, v in r["_day_values"].items():
+                if d not in all_days or not v:
+                    continue
+                out.append({
+                    "Month":                  month_label,
+                    "Invoice No":             r["Invoice No"],
+                    "Invoice Date":           r["Invoice Date"].isoformat() if r["Invoice Date"] else "",
+                    "Customer":               r["Customer"],
+                    "Full Qty Delivery Date": r["Full Qty Delivery Date."].isoformat() if r["Full Qty Delivery Date."] else "",
+                    "Invoice Value":          r["Invoice Value"] if r["Invoice Value"] is not None else "",
+                    "Invoice QTY":            r["Invoice QTY"] if r["Invoice QTY"] is not None else "",
+                    "Date":                   d.isoformat(),
+                    "Value":                  v,
+                })
+    return out
+
+
 # ========= MAIN ==========
 if __name__ == "__main__":
     userinfo = login()
@@ -569,10 +618,11 @@ if __name__ == "__main__":
     if not switch_company(company_id):
         sys.exit(1)
 
-    # Fetch invoices with invoice_date >= 2026-04-01.
-    # The month-filter happens later when we keep only rows with partial-delivery
-    # activity in the current month's Sun-Thu workdays.
-    REPORT_FROM = date(2026, 4, 1)
+    # Fetch invoices covering the last DUMP_MONTHS calendar months so the Dump
+    # sheet has data for the full window. The per-month filter still happens
+    # later in build_report (Sun-Thu workdays of each month).
+    month_starts_window = last_n_month_starts(today, DUMP_MONTHS)
+    REPORT_FROM = month_starts_window[0]
 
     invoices = fetch_combine_invoices(allowed, invoice_date_from=REPORT_FROM.isoformat())
     print(f"✅ {len(invoices)} combine invoices fetched (since {REPORT_FROM})")
@@ -661,6 +711,23 @@ if __name__ == "__main__":
         worksheet.clear()
         set_with_dataframe(worksheet, df_flat)
         print(f"✅ Data pasted to Google Sheets → '{WORKSHEET_NAME}'")
+
+        # ----- Dump sheet: long-format rolling N months -----
+        dump_rows = build_dump_rows(invoices, invoice_lines, ops, month_starts_window)
+        dump_cols = ["Month", "Invoice No", "Invoice Date", "Customer",
+                     "Full Qty Delivery Date", "Invoice Value", "Invoice QTY",
+                     "Date", "Value"]
+        df_dump = pd.DataFrame(dump_rows, columns=dump_cols)
+        try:
+            dump_ws = sheet.worksheet(DUMP_WORKSHEET_NAME)
+        except gspread.WorksheetNotFound:
+            dump_ws = sheet.add_worksheet(title=DUMP_WORKSHEET_NAME,
+                                          rows=max(1000, len(df_dump) + 50),
+                                          cols=max(15, len(df_dump.columns) + 2))
+        dump_ws.clear()
+        set_with_dataframe(dump_ws, df_dump)
+        months_str = ", ".join(ms.strftime("%b%y") for ms in month_starts_window)
+        print(f"✅ Dump pasted to Google Sheets → '{DUMP_WORKSHEET_NAME}' ({len(df_dump)} rows; months: {months_str})")
     except Exception as e:
         import traceback
         print(f"❌ Error while pasting to Google Sheets: {e}")
