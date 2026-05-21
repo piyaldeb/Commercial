@@ -301,9 +301,8 @@ def push_to_sheet(rows):
     for c in numeric_cols:
         df[c] = df[c].round(0)
 
-    # Sheet has a dashboard in rows 1-12 and column headers on row 13.
-    # Data is pasted from row 14 onward; row 13 (headers) stays untouched.
-    START_ROW = 14
+    # Sheet has a dashboard in rows 1-12. Headers go on row 13, data from row 14.
+    HEADER_ROW = 13
 
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_KEY)
@@ -312,27 +311,28 @@ def push_to_sheet(rows):
     except gspread.WorksheetNotFound:
         ws = sheet.add_worksheet(
             title=WORKSHEET_NAME,
-            rows=max(1000, START_ROW + len(df) + 50),
+            rows=max(1000, HEADER_ROW + len(df) + 50),
             cols=max(20, len(df.columns) + 5),
         )
 
-    # Make sure the sheet has enough rows for the new data.
-    needed_rows = START_ROW + len(df) - 1
+    # Make sure the sheet has enough rows for the header + data.
+    needed_rows = HEADER_ROW + len(df)
     if ws.row_count < needed_rows:
         ws.add_rows(needed_rows - ws.row_count)
 
-    # Clear row 14 downward (keep dashboard in rows 1-12 and headers on row 13).
+    # Clear from row 13 down (keep dashboard in rows 1-12 untouched).
     last_col_letter = gspread.utils.rowcol_to_a1(1, ws.col_count).rstrip("1")
-    ws.batch_clear([f"A{START_ROW}:{last_col_letter}{ws.row_count}"])
+    ws.batch_clear([f"A{HEADER_ROW}:{last_col_letter}{ws.row_count}"])
 
+    # Write headers on row 13, then data on row 14 onward.
     set_with_dataframe(
         ws, df,
-        row=START_ROW, col=1,
+        row=HEADER_ROW, col=1,
         include_index=False,
-        include_column_header=False,
+        include_column_header=True,
         resize=False,
     )
-    log.info(f"Pasted {len(df)} rows to '{WORKSHEET_NAME}' starting at row {START_ROW}")
+    log.info(f"Pasted {len(df)} rows + header to '{WORKSHEET_NAME}' starting at row {HEADER_ROW}")
 
 
 def main():
