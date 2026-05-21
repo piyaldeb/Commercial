@@ -301,10 +301,9 @@ def push_to_sheet(rows):
     for c in numeric_cols:
         df[c] = df[c].round(0)
 
-    # Sheet has a dashboard in rows 1-12; OA table starts at row 13.
-    # Headers already exist on row 13, so paste data only from row 14 onward.
+    # Sheet has a dashboard in rows 1-12 and column headers on row 13.
+    # Data is pasted from row 14 onward; row 13 (headers) stays untouched.
     START_ROW = 14
-    HEADER_ROW = 13
 
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_KEY)
@@ -322,9 +321,9 @@ def push_to_sheet(rows):
     if ws.row_count < needed_rows:
         ws.add_rows(needed_rows - ws.row_count)
 
-    # Clear row 13 downward (keep rows 1-12 untouched).
+    # Clear row 14 downward (keep dashboard in rows 1-12 and headers on row 13).
     last_col_letter = gspread.utils.rowcol_to_a1(1, ws.col_count).rstrip("1")
-    ws.batch_clear([f"A{HEADER_ROW}:{last_col_letter}{ws.row_count}"])
+    ws.batch_clear([f"A{START_ROW}:{last_col_letter}{ws.row_count}"])
 
     set_with_dataframe(
         ws, df,
