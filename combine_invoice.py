@@ -143,7 +143,6 @@ def fetch_combine_invoices(allowed_company_ids, invoice_date_from=None):
     }
     spec = {
         "name":                    {},
-        "company_id":              {"fields": {"display_name": {}}},
         "create_date":             {},
         "report_date":             {},
         "delivery_date":           {},
@@ -218,6 +217,7 @@ def fetch_combine_invoice_lines(allowed_company_ids, invoice_ids):
     spec = {
         "invoice_id":      {"fields": {"display_name": {}}},
         "sale_order_line": {"fields": {"display_name": {}}},
+        "company_id":      {"fields": {"display_name": {}}},
         "delivery_date":   {},
         "quantity":        {},
         "price_subtotal":  {},
@@ -387,13 +387,18 @@ def build_report(invoices, invoice_lines, ops, month_start):
             return None
 
     # ---- invoice_id → list of sale_order_line IDs ----
+    # combine.invoice has no company field, but its lines do. A single invoice can
+    # span multiple companies (one per sale_order_line), so track company per sol.
     inv_to_sale_lines = {}
+    sol_to_company = {}
     for il in invoice_lines:
         inv_id = (il.get("invoice_id") or {}).get("id")
         sol = (il.get("sale_order_line") or {}).get("id")
         if inv_id is None or sol is None:
             continue
         inv_to_sale_lines.setdefault(inv_id, set()).add(sol)
+        if sol not in sol_to_company:
+            sol_to_company[sol] = (il.get("company_id") or {}).get("display_name", "")
 
     # ---- (sale_order_line, day) → summed qty*final_price ----
     op_lookup = {}
@@ -417,24 +422,30 @@ def build_report(invoices, invoice_lines, ops, month_start):
         op_lookup[(sol, day)] = op_lookup.get((sol, day), 0.0) + v
 
     # ---- per-invoice daily values ----
+    # day_values is keyed by day for the xlsx/report layout (company-agnostic),
+    # while company_day_values is keyed by (day, company) so the Dump sheet can
+    # emit one row per company per day for mixed-company invoices.
     rows = []
     for inv in invoices:
         inv_id = inv.get("id")
         ddate = _to_day(inv.get("delivery_date"))
         day_values = {}
+        company_day_values = {}
         sol_ids = inv_to_sale_lines.get(inv_id, set())
         for (sol, day), v in op_lookup.items():
             if sol in sol_ids and day in all_days:
                 day_values[day] = day_values.get(day, 0.0) + v
+                comp = sol_to_company.get(sol, "")
+                company_day_values[(day, comp)] = company_day_values.get((day, comp), 0.0) + v
         rows.append({
             "Invoice No":              inv.get("name") or "",
-            "Company":                 (inv.get("company_id") or {}).get("display_name", ""),
             "Invoice Date":            _to_day(inv.get("invoice_date")),
             "Customer":                (inv.get("partner_id") or {}).get("display_name", ""),
             "Full Qty Delivery Date.": ddate,
             "Invoice Value":           inv.get("amount_total"),
             "Invoice QTY":             inv.get("qty_total"),
             "_day_values":             day_values,
+            "_company_day_values":     company_day_values,
         })
     return rows, weeks
 
@@ -582,8 +593,9 @@ def build_dump_rows(invoices, invoice_lines, ops, month_starts):
     Columns:
         Month, Invoice No, Company, Invoice Date, Customer, Full Qty Delivery Date,
         Invoice Value, Invoice QTY, Date, Value
-    One output row per (invoice, day) that has a non-zero partial-delivery value
-    within that month's Sun-Thu workdays.
+    One output row per (invoice, day, company) that has a non-zero partial-delivery
+    value within that month's Sun-Thu workdays. Invoices that span multiple
+    companies produce a separate row per company for each day.
     """
     out = []
     for ms in month_starts:
@@ -591,13 +603,13 @@ def build_dump_rows(invoices, invoice_lines, ops, month_starts):
         all_days = {d for wk in weeks for d in wk}
         month_label = ms.strftime("%b%y")  # e.g. "May26"
         for r in rows:
-            for d, v in r["_day_values"].items():
+            for (d, comp), v in r["_company_day_values"].items():
                 if d not in all_days or not v:
                     continue
                 out.append({
                     "Month":                  month_label,
                     "Invoice No":             r["Invoice No"],
-                    "Company":                r["Company"],
+                    "Company":                comp,
                     "Invoice Date":           r["Invoice Date"].isoformat() if r["Invoice Date"] else "",
                     "Customer":               r["Customer"],
                     "Full Qty Delivery Date": r["Full Qty Delivery Date."].isoformat() if r["Full Qty Delivery Date."] else "",
