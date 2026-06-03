@@ -143,6 +143,7 @@ def fetch_combine_invoices(allowed_company_ids, invoice_date_from=None):
     }
     spec = {
         "name":                    {},
+        "company_id":              {"fields": {"display_name": {}}},
         "create_date":             {},
         "report_date":             {},
         "delivery_date":           {},
@@ -427,6 +428,7 @@ def build_report(invoices, invoice_lines, ops, month_start):
                 day_values[day] = day_values.get(day, 0.0) + v
         rows.append({
             "Invoice No":              inv.get("name") or "",
+            "Company":                 (inv.get("company_id") or {}).get("display_name", ""),
             "Invoice Date":            _to_day(inv.get("invoice_date")),
             "Customer":                (inv.get("partner_id") or {}).get("display_name", ""),
             "Full Qty Delivery Date.": ddate,
@@ -578,7 +580,7 @@ def build_dump_rows(invoices, invoice_lines, ops, month_starts):
     Produce long-format rows for the Dump sheet across multiple months.
 
     Columns:
-        Month, Invoice No, Invoice Date, Customer, Full Qty Delivery Date,
+        Month, Invoice No, Company, Invoice Date, Customer, Full Qty Delivery Date,
         Invoice Value, Invoice QTY, Date, Value
     One output row per (invoice, day) that has a non-zero partial-delivery value
     within that month's Sun-Thu workdays.
@@ -595,6 +597,7 @@ def build_dump_rows(invoices, invoice_lines, ops, month_starts):
                 out.append({
                     "Month":                  month_label,
                     "Invoice No":             r["Invoice No"],
+                    "Company":                r["Company"],
                     "Invoice Date":           r["Invoice Date"].isoformat() if r["Invoice Date"] else "",
                     "Customer":               r["Customer"],
                     "Full Qty Delivery Date": r["Full Qty Delivery Date."].isoformat() if r["Full Qty Delivery Date."] else "",
@@ -714,7 +717,7 @@ if __name__ == "__main__":
 
         # ----- Dump sheet: long-format rolling N months -----
         dump_rows = build_dump_rows(invoices, invoice_lines, ops, month_starts_window)
-        dump_cols = ["Month", "Invoice No", "Invoice Date", "Customer",
+        dump_cols = ["Month", "Invoice No", "Company", "Invoice Date", "Customer",
                      "Full Qty Delivery Date", "Invoice Value", "Invoice QTY",
                      "Date", "Value"]
         df_dump = pd.DataFrame(dump_rows, columns=dump_cols)
