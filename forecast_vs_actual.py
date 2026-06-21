@@ -149,143 +149,100 @@ def fetch_company_name(company_id):
     res = r.json().get("result") or []
     return res[0]["name"] if res else str(company_id)
 
-# ========= FETCH FORECAST HEADERS (month + line ids) ==========
-def fetch_forecast_headers(company_id):
-    """
-    Read rolling.forecast headers for the company. Each header is one
-    salesperson/team projection for a month; next_month_line_ids are the raw
-    detail lines. Returns list of header dicts.
-    """
+# ========= FETCH AVAILABLE FORECAST MONTHS ==========
+def fetch_forecast_months(company_id):
+    """Return ordered list of {next_month, next_month_label} distinct values."""
     ctx = {"lang": "en_US", "tz": "Asia/Dhaka", "uid": USER_ID,
            "allowed_company_ids": [company_id]}
-    out = []
-    offset = 0
-    page = 2000
-    while True:
-        payload = {
-            "jsonrpc": "2.0", "method": "call",
-            "params": {
-                "model": "rolling.forecast", "method": "search_read", "args": [],
-                "kwargs": {
-                    "domain": [["company_id", "=", company_id], ["next_month", "!=", False]],
-                    "fields": ["id", "next_month", "next_month_label", "next_month_line_ids"],
-                    "offset": offset, "limit": page, "order": "next_month DESC",
-                    "context": ctx,
-                },
+    payload = {
+        "jsonrpc": "2.0", "method": "call",
+        "params": {
+            "model": "rolling.forecast", "method": "search_read", "args": [],
+            "kwargs": {
+                "domain": [["company_id", "=", company_id], ["next_month", "!=", False]],
+                "fields": ["next_month", "next_month_label"],
+                "context": ctx,
             },
-        }
-        r = retry_request(session.post,
-                          f"{ODOO_URL}/web/dataset/call_kw/rolling.forecast/search_read",
-                          json=payload)
-        recs = r.json().get("result") or []
-        out.extend(recs)
-        if len(recs) < page:
-            break
-        offset += page
-    return out
+        },
+    }
+    r = retry_request(session.post,
+                      f"{ODOO_URL}/web/dataset/call_kw/rolling.forecast/search_read", json=payload)
+    recs = r.json().get("result") or []
+    seen = {}
+    for rec in recs:
+        m = rec.get("next_month")
+        if m and m not in seen:
+            seen[m] = rec.get("next_month_label") or m
+    return [{"next_month": m, "next_month_label": seen[m]} for m in sorted(seen)]
 
-# ========= FETCH RAW FORECAST LINES ==========
-# Dimension/measure fields pulled from each rolling.forecast.line so you can
-# group by any of them yourself in the sheet.
-LINE_FIELDS = [
-    "id", "qty", "avg_price", "total_price", "achived", "achieved_value",
-    "item_achived", "account_type", "type", "classification", "segments",
-    "sales_person_region", "forecast_product_id", "item_category",
-    "customer_name", "customer_group", "buyer", "brand_group",
-    "salesperson_id", "sales_team_id", "division_state", "currency_id",
-]
+# ========= FETCH FORECAST-VS-ACTUAL (dashboard) ==========
+# group_by = "customer": one row per customer. The dashboard pairs the forecast
+# with the actual OA-released figures (its "OA Released" columns) — that is the
+# real forecast-vs-actual comparison. (achieved_value on the raw line is a broken
+# per-header rollup, so we use the dashboard instead.)
+GROUP_BY = "customer"
+ONLY_FORECAST = False
+FORECAST_TYPE = "local_foreign"
 
-def fetch_forecast_lines(company_id, line_ids):
-    """Batch-read rolling.forecast.line records by id with all dimension fields."""
+def fetch_forecast_dashboard(company_id, month, group_by, only_forecast, ftype):
+    """Return {rows, totals, month_label} for one month/breakdown."""
     ctx = {"lang": "en_US", "tz": "Asia/Dhaka", "uid": USER_ID,
            "allowed_company_ids": [company_id]}
+    payload = {
+        "jsonrpc": "2.0", "method": "call",
+        "params": {
+            "model": "rolling.forecast",
+            "method": "retrieve_unified_performance_dashboard",
+            "args": [company_id, month, group_by, only_forecast, ftype],
+            "kwargs": {"context": ctx},
+        },
+    }
+    r = retry_request(
+        session.post,
+        f"{ODOO_URL}/web/dataset/call_kw/rolling.forecast/retrieve_unified_performance_dashboard",
+        json=payload,
+    )
+    body = r.json()
+    if "error" in body:
+        raise Exception(f"dashboard fetch failed for {month}: "
+                        f"{body['error'].get('message') or body['error']}")
+    return body.get("result") or {"rows": [], "totals": {}, "month_label": month}
+
+# ========= BUILD FORECAST-VS-ACTUAL ROWS ==========
+def build_forecast_rows(company_id, company_name, months):
+    """
+    One row per (month, customer): Forecast QTY/Value vs Actual (OA Released)
+    QTY/Value, plus Achievement %. Months emitted newest → oldest.
+    """
+    months_sorted = sorted(months, key=lambda m: m["next_month"], reverse=True)
     out = []
-    CHUNK = 2000
-    for i in range(0, len(line_ids), CHUNK):
-        chunk = line_ids[i:i + CHUNK]
-        payload = {
-            "jsonrpc": "2.0", "method": "call",
-            "params": {
-                "model": "rolling.forecast.line", "method": "read",
-                "args": [chunk, LINE_FIELDS],
-                "kwargs": {"context": ctx},
-            },
-        }
-        r = retry_request(session.post,
-                          f"{ODOO_URL}/web/dataset/call_kw/rolling.forecast.line/read",
-                          json=payload)
-        body = r.json()
-        if "error" in body:
-            raise Exception(f"line read failed: {body['error'].get('message') or body['error']}")
-        out.extend(body.get("result") or [])
+    for m in months_sorted:
+        month = m["next_month"]
+        data = fetch_forecast_dashboard(company_id, month, GROUP_BY, ONLY_FORECAST, FORECAST_TYPE)
+        rows = data.get("rows") or []
+        month_label = data.get("month_label") or m["next_month_label"]
+        for r in rows:
+            fval = r.get("forecast_value") or 0.0
+            oaval = r.get("oa_value") or 0.0
+            out.append({
+                "Company":         company_name,
+                "Month":           month,
+                "Month Label":     month_label,
+                "Customer":        r.get("name", ""),
+                "Forecast QTY":    r.get("forecast_qty") or 0.0,
+                "Forecast Value":  fval,
+                "Actual QTY":      r.get("oa_qty") or 0.0,
+                "Actual Value":    oaval,
+                # Achievement = actual / forecast, as a fraction (format as % in sheet)
+                "Achievement %":   (oaval / fval) if fval else 0.0,
+            })
+        print(f"📋 {month_label}: {len(rows)} customers")
     return out
 
-def _m2o_name(v):
-    """Odoo many2one comes back as [id, name] or False -> return name or ''."""
-    return v[1] if isinstance(v, (list, tuple)) and len(v) == 2 else ""
-
-# ========= BUILD RAW FORECAST ROWS (one row per forecast line) ==========
-def build_forecast_rows(company_id, company_name, headers):
-    """
-    Flatten raw rolling.forecast.line records into one row each, tagged with
-    Company + Month. Every dimension is its own column so you can group by
-    Product / Customer / Brand / Salesperson / Team / Division yourself.
-
-    Months emitted newest → oldest (headers are pre-sorted that way).
-    """
-    # month per line id, from the headers
-    line_month = {}   # line_id -> (month, month_label)
-    all_line_ids = []
-    for h in headers:
-        m = h.get("next_month")
-        ml = h.get("next_month_label") or m
-        for lid in h.get("next_month_line_ids") or []:
-            if lid not in line_month:
-                line_month[lid] = (m, ml)
-                all_line_ids.append(lid)
-
-    print(f"   {company_name}: {len(headers)} headers, {len(all_line_ids)} forecast lines")
-    lines = fetch_forecast_lines(company_id, all_line_ids)
-
-    out = []
-    for ln in lines:
-        month, month_label = line_month.get(ln["id"], ("", ""))
-        out.append({
-            "Company":        company_name,
-            "Month":          month,
-            "Month Label":    month_label,
-            "Product":        _m2o_name(ln.get("item_category")),
-            "Forecast Product": _m2o_name(ln.get("forecast_product_id")),
-            "Customer":       _m2o_name(ln.get("customer_name")),
-            "Customer Group": _m2o_name(ln.get("customer_group")),
-            "Brand":          _m2o_name(ln.get("buyer")),
-            "Brand Group":    _m2o_name(ln.get("brand_group")),
-            "Salesperson":    _m2o_name(ln.get("salesperson_id")),
-            "Sales Team":     _m2o_name(ln.get("sales_team_id")),
-            "Division":       ln.get("division_state") or "",
-            "Region":         ln.get("sales_person_region") or "",
-            "Account Type":   ln.get("account_type") or "",
-            "Type":           ln.get("type") or "",
-            "Classification": ln.get("classification") or "",
-            "Segments":       ln.get("segments") or "",
-            "Currency":       _m2o_name(ln.get("currency_id")),
-            "Forecast QTY":   ln.get("qty", 0.0),
-            "Avg Price":      ln.get("avg_price", 0.0),
-            "Forecast Value": ln.get("total_price", 0.0),
-            "Achieved QTY":   ln.get("achived", 0.0),
-            "Achieved Value": ln.get("achieved_value", 0.0),
-        })
-    # newest month first (headers already DESC, but be explicit / stable)
-    out.sort(key=lambda r: r["Month"], reverse=True)
-    return out
-
-# Output columns, in order. Dimensions first (group by any of these), then
-# measures. Keep this in sync with build_forecast_rows().
-COLS = ["Company", "Month", "Month Label", "Product", "Forecast Product",
-        "Customer", "Customer Group", "Brand", "Brand Group", "Salesperson",
-        "Sales Team", "Division", "Region", "Account Type", "Type",
-        "Classification", "Segments", "Currency",
-        "Forecast QTY", "Avg Price", "Forecast Value", "Achieved QTY", "Achieved Value"]
+# Output columns, in order. Forecast vs Actual, by customer.
+COLS = ["Company", "Month", "Month Label", "Customer",
+        "Forecast QTY", "Forecast Value", "Actual QTY", "Actual Value",
+        "Achievement %"]
 
 # ========= MAIN ==========
 if __name__ == "__main__":
@@ -297,19 +254,18 @@ if __name__ == "__main__":
             print(f"⚠️ Skipping company {cid} (could not switch)")
             continue
         company_name = fetch_company_name(cid)
-        headers = fetch_forecast_headers(cid)
-        if not headers:
-            print(f"⚠️ {company_name}: no forecast headers, skipping")
+        months = fetch_forecast_months(cid)
+        if not months:
+            print(f"⚠️ {company_name}: no forecast months, skipping")
             continue
-        months = sorted({h.get("next_month") for h in headers if h.get("next_month")})
-        print(f"🏢 {company_name} (id={cid}): {len(headers)} headers, "
-              f"months {months[0]} → {months[-1]}")
-        forecast_rows.extend(build_forecast_rows(cid, company_name, headers))
+        print(f"🏢 {company_name} (id={cid}): {len(months)} months "
+              f"{months[0]['next_month']} → {months[-1]['next_month']}")
+        forecast_rows.extend(build_forecast_rows(cid, company_name, months))
 
     if not forecast_rows:
         print("❌ No forecast rows fetched for any company.")
         sys.exit(1)
-    print(f"📊 Total forecast lines: {len(forecast_rows)}")
+    print(f"📊 Total forecast-vs-actual rows: {len(forecast_rows)}")
 
     df = pd.DataFrame(forecast_rows, columns=COLS)
 
@@ -340,31 +296,27 @@ if __name__ == "__main__":
 
         set_with_dataframe(ws, df)
 
-        # Pin the measure columns to a plain number format. They are the last 5
-        # columns of COLS: Forecast QTY, Avg Price, Forecast Value, Achieved QTY,
-        # Achieved Value -> 0-based indices 18..22.
+        # Format the measure columns. Forecast QTY/Value + Actual QTY/Value are
+        # plain numbers (COLS idx 4..7); Achievement % is a percent (idx 8).
         try:
-            number_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "0.##########"}}
-            requests = []
-            for col_idx in range(len(COLS) - 5, len(COLS)):
-                requests.append({
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": ws.id,
-                            "startRowIndex": 1,  # skip header
-                            "startColumnIndex": col_idx,
-                            "endColumnIndex": col_idx + 1,
-                        },
-                        "cell": {"userEnteredFormat": number_fmt},
-                        "fields": "userEnteredFormat.numberFormat",
-                    }
-                })
+            number_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.##"}}
+            pct_fmt = {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}
+
+            def _fmt_req(idx, fmt):
+                return {"repeatCell": {
+                    "range": {"sheetId": ws.id, "startRowIndex": 1,
+                              "startColumnIndex": idx, "endColumnIndex": idx + 1},
+                    "cell": {"userEnteredFormat": fmt},
+                    "fields": "userEnteredFormat.numberFormat"}}
+
+            requests = [_fmt_req(i, number_fmt) for i in range(4, 8)]  # qty/value cols
+            requests.append(_fmt_req(8, pct_fmt))                       # Achievement %
             ws.spreadsheet.batch_update({"requests": requests})
         except Exception as fmt_err:
             print(f"⚠️ Could not set Forecast number formats: {fmt_err}")
 
         print(f"✅ Forecast pasted to Google Sheets → '{FORECAST_WORKSHEET_NAME}' "
-              f"({len(df)} raw forecast lines)")
+              f"({len(df)} forecast-vs-actual rows)")
     except Exception as e:
         import traceback
         print(f"❌ Error while pasting to Google Sheets: {e}")
