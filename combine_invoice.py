@@ -740,7 +740,42 @@ if __name__ == "__main__":
                                           rows=max(1000, len(df_dump) + 50),
                                           cols=max(15, len(df_dump.columns) + 2))
         dump_ws.clear()
+        # clear() wipes values but NOT cell formatting. Stale date-formatting left
+        # on the Invoice QTY column from a previous run makes plain quantities like
+        # 23153 render as a date (e.g. 1963-05-21). Reset all formatting, then pin
+        # the numeric columns to a plain number format so Sheets can't re-coerce.
+        try:
+            dump_ws.spreadsheet.batch_update({
+                "requests": [{
+                    "updateCells": {
+                        "range": {"sheetId": dump_ws.id},
+                        "fields": "userEnteredFormat",
+                    }
+                }]
+            })
+        except Exception as fmt_err:
+            print(f"⚠️ Could not clear Dump formatting: {fmt_err}")
         set_with_dataframe(dump_ws, df_dump)
+        # Pin Invoice Value (G), Invoice QTY (H) and Value (J) to plain number format.
+        try:
+            number_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "0.##########"}}
+            requests = []
+            for col_idx in (6, 7, 9):  # 0-based: G, H, J
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": dump_ws.id,
+                            "startRowIndex": 1,  # skip header
+                            "startColumnIndex": col_idx,
+                            "endColumnIndex": col_idx + 1,
+                        },
+                        "cell": {"userEnteredFormat": number_fmt},
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                })
+            dump_ws.spreadsheet.batch_update({"requests": requests})
+        except Exception as fmt_err:
+            print(f"⚠️ Could not set Dump number formats: {fmt_err}")
         months_str = ", ".join(ms.strftime("%b%y") for ms in month_starts_window)
         print(f"✅ Dump pasted to Google Sheets → '{DUMP_WORKSHEET_NAME}' ({len(df_dump)} rows; months: {months_str})")
     except Exception as e:
