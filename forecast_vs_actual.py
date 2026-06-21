@@ -34,7 +34,8 @@ FORECAST_WORKSHEET_NAME = "Forecast"
 # Filter values observed in the "Forecast VS Actual" dashboard HAR:
 #   retrieve_unified_performance_dashboard(company_id, month, group_by, only_forecast, type)
 #   = (3, "2026-08", "customer", False, "local_foreign")
-COMPANY_ID = 3              # "Metal Trims"
+# Pull the forecast for both companies; the Company column distinguishes them.
+COMPANY_IDS = [3, 1]        # 3 = "Metal Trims", 1 = "Zipper"
 ONLY_FORECAST = False       # "Only Forecast" checkbox unticked
 FORECAST_TYPE = "local_foreign"  # "Local & Foreign"
 
@@ -271,21 +272,25 @@ def build_forecast_rows(company_id, company_name, months, group_bys, only_foreca
 if __name__ == "__main__":
     login()
 
-    if not switch_company(COMPANY_ID):
-        sys.exit(1)
-
-    company_name = fetch_company_name(COMPANY_ID)
-    print(f"🏢 Company: {company_name}")
-
-    months = fetch_forecast_months(COMPANY_ID)
-    if not months:
-        print("❌ No forecast months found.")
-        sys.exit(1)
-    print(f"🗓️  {len(months)} months: {months[0]['next_month']} → {months[-1]['next_month']}")
     print(f"🧩 group-bys: {', '.join(lbl for _, lbl in GROUP_BYS)}")
+    forecast_rows = []
+    for cid in COMPANY_IDS:
+        if not switch_company(cid):
+            print(f"⚠️ Skipping company {cid} (could not switch)")
+            continue
+        company_name = fetch_company_name(cid)
+        months = fetch_forecast_months(cid)
+        if not months:
+            print(f"⚠️ {company_name}: no forecast months, skipping")
+            continue
+        print(f"🏢 {company_name} (id={cid}): {len(months)} months "
+              f"{months[0]['next_month']} → {months[-1]['next_month']}")
+        forecast_rows.extend(build_forecast_rows(
+            cid, company_name, months, GROUP_BYS, ONLY_FORECAST, FORECAST_TYPE))
 
-    forecast_rows = build_forecast_rows(
-        COMPANY_ID, company_name, months, GROUP_BYS, ONLY_FORECAST, FORECAST_TYPE)
+    if not forecast_rows:
+        print("❌ No forecast rows fetched for any company.")
+        sys.exit(1)
     print(f"📊 Total forecast rows: {len(forecast_rows)}")
 
     cols = ["Company", "Type", "Group By", "Only Forecast", "Month", "Month Label",
