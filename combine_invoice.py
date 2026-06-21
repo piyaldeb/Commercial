@@ -739,16 +739,22 @@ if __name__ == "__main__":
             dump_ws = sheet.add_worksheet(title=DUMP_WORKSHEET_NAME,
                                           rows=max(1000, len(df_dump) + 50),
                                           cols=max(15, len(df_dump.columns) + 2))
-        dump_ws.clear()
-        # clear() wipes values but NOT cell formatting. Stale date-formatting left
-        # on the Invoice QTY column from a previous run makes plain quantities like
-        # 23153 render as a date (e.g. 1963-05-21). Reset all formatting, then pin
-        # the numeric columns to a plain number format so Sheets can't re-coerce.
+        # Only touch columns A:J (the data we write); leave K onward (notes,
+        # pivots, formulas the user added) untouched. df_dump has 10 columns.
+        dump_ws.batch_clear(["A:J"])
+        # batch_clear wipes values but NOT cell formatting. Stale date-formatting
+        # left on the Invoice QTY column from a previous run makes plain quantities
+        # like 23153 render as a date (e.g. 1963-05-21). Reset formatting on A:J
+        # only, then pin the numeric columns to a plain number format.
         try:
             dump_ws.spreadsheet.batch_update({
                 "requests": [{
                     "updateCells": {
-                        "range": {"sheetId": dump_ws.id},
+                        "range": {
+                            "sheetId": dump_ws.id,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 10,  # A..J (end exclusive)
+                        },
                         "fields": "userEnteredFormat",
                     }
                 }]
