@@ -176,11 +176,22 @@ def fetch_forecast_months(company_id):
     return [{"next_month": m, "next_month_label": seen[m]} for m in sorted(seen)]
 
 # ========= FETCH FORECAST-VS-ACTUAL (dashboard) ==========
-# group_by = "customer": one row per customer. The dashboard pairs the forecast
-# with the actual OA-released figures (its "OA Released" columns) — that is the
-# real forecast-vs-actual comparison. (achieved_value on the raw line is a broken
-# per-header rollup, so we use the dashboard instead.)
-GROUP_BY = "customer"
+# The dashboard pairs the forecast with the actual OA-released figures (its
+# "OA Released" columns) — the real forecast-vs-actual. (achieved_value on the
+# raw line is a broken per-header rollup, so we use the dashboard instead.)
+#
+# Pull EVERY breakdown the dashboard dropdown offers, as (api_key, label).
+# Verified live — each returns a genuinely distinct breakdown. The product
+# breakdown's API key is "item" (SHANK BUTTON, ALLOY...); the literal "product"
+# silently falls back to customer.
+GROUP_BYS = [
+    ("item",        "By Product"),
+    ("salesperson", "By Salesperson"),
+    ("team",        "By Team"),
+    ("division",    "By Division"),
+    ("customer",    "By Customer"),
+    ("brand",       "By Brand"),
+]
 ONLY_FORECAST = False
 FORECAST_TYPE = "local_foreign"
 
@@ -211,36 +222,42 @@ def fetch_forecast_dashboard(company_id, month, group_by, only_forecast, ftype):
 # ========= BUILD FORECAST-VS-ACTUAL ROWS ==========
 def build_forecast_rows(company_id, company_name, months):
     """
-    One row per (month, customer): Forecast QTY/Value vs Actual (OA Released)
-    QTY/Value, plus Achievement %. Months emitted newest → oldest.
+    One row per (month, group-by, entry): Forecast QTY/Value vs Actual (OA
+    Released) QTY/Value, plus Achievement %. The breakdowns are stacked with a
+    "Group By" column so the sheet filters like the dashboard dropdown — set
+    Group By = "By Team" (or Customer / Product / Salesperson / Division / Brand)
+    to see that breakdown's forecast-vs-actual. Months emitted newest → oldest.
     """
     months_sorted = sorted(months, key=lambda m: m["next_month"], reverse=True)
     out = []
     for m in months_sorted:
         month = m["next_month"]
-        data = fetch_forecast_dashboard(company_id, month, GROUP_BY, ONLY_FORECAST, FORECAST_TYPE)
-        rows = data.get("rows") or []
-        month_label = data.get("month_label") or m["next_month_label"]
-        for r in rows:
-            fval = r.get("forecast_value") or 0.0
-            oaval = r.get("oa_value") or 0.0
-            out.append({
-                "Company":         company_name,
-                "Month":           month,
-                "Month Label":     month_label,
-                "Customer":        r.get("name", ""),
-                "Forecast QTY":    r.get("forecast_qty") or 0.0,
-                "Forecast Value":  fval,
-                "Actual QTY":      r.get("oa_qty") or 0.0,
-                "Actual Value":    oaval,
-                # Achievement = actual / forecast, as a fraction (format as % in sheet)
-                "Achievement %":   (oaval / fval) if fval else 0.0,
-            })
-        print(f"📋 {month_label}: {len(rows)} customers")
+        for group_key, group_label in GROUP_BYS:
+            data = fetch_forecast_dashboard(company_id, month, group_key,
+                                            ONLY_FORECAST, FORECAST_TYPE)
+            rows = data.get("rows") or []
+            month_label = data.get("month_label") or m["next_month_label"]
+            for r in rows:
+                fval = r.get("forecast_value") or 0.0
+                oaval = r.get("oa_value") or 0.0
+                out.append({
+                    "Company":         company_name,
+                    "Month":           month,
+                    "Month Label":     month_label,
+                    "Group By":        group_label,
+                    "Name":            r.get("name", ""),
+                    "Forecast QTY":    r.get("forecast_qty") or 0.0,
+                    "Forecast Value":  fval,
+                    "Actual QTY":      r.get("oa_qty") or 0.0,
+                    "Actual Value":    oaval,
+                    # Achievement = actual / forecast, as a fraction (format as % in sheet)
+                    "Achievement %":   (oaval / fval) if fval else 0.0,
+                })
+            print(f"📋 {month_label} / {group_label}: {len(rows)} rows")
     return out
 
-# Output columns, in order. Forecast vs Actual, by customer.
-COLS = ["Company", "Month", "Month Label", "Customer",
+# Output columns, in order. Forecast vs Actual, per breakdown (Group By).
+COLS = ["Company", "Month", "Month Label", "Group By", "Name",
         "Forecast QTY", "Forecast Value", "Actual QTY", "Actual Value",
         "Achievement %"]
 
@@ -309,8 +326,8 @@ if __name__ == "__main__":
                     "cell": {"userEnteredFormat": fmt},
                     "fields": "userEnteredFormat.numberFormat"}}
 
-            requests = [_fmt_req(i, number_fmt) for i in range(4, 8)]  # qty/value cols
-            requests.append(_fmt_req(8, pct_fmt))                       # Achievement %
+            requests = [_fmt_req(i, number_fmt) for i in range(5, 9)]  # qty/value cols
+            requests.append(_fmt_req(9, pct_fmt))                       # Achievement %
             ws.spreadsheet.batch_update({"requests": requests})
         except Exception as fmt_err:
             print(f"⚠️ Could not set Forecast number formats: {fmt_err}")
