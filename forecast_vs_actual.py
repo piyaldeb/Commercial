@@ -35,9 +35,21 @@ FORECAST_WORKSHEET_NAME = "Forecast"
 #   retrieve_unified_performance_dashboard(company_id, month, group_by, only_forecast, type)
 #   = (3, "2026-08", "customer", False, "local_foreign")
 COMPANY_ID = 3              # "Metal Trims"
-GROUP_BY = "customer"       # By Customer
 ONLY_FORECAST = False       # "Only Forecast" checkbox unticked
 FORECAST_TYPE = "local_foreign"  # "Local & Foreign"
+
+# Every group-by breakdown the dashboard dropdown offers, as (api_key, label).
+# Verified live against the endpoint — each key returns a genuinely distinct
+# breakdown. NOTE the product breakdown's API key is "item" (SHANK BUTTON,
+# ALLOY, RIVET...); the literal key "product" silently falls back to customer.
+GROUP_BYS = [
+    ("item",        "By Product"),
+    ("salesperson", "By Salesperson"),
+    ("team",        "By Team"),
+    ("division",    "By Division"),
+    ("customer",    "By Customer"),
+    ("brand",       "By Brand"),
+]
 
 session = requests.Session()
 USER_ID = None
@@ -207,46 +219,52 @@ def fetch_forecast_dashboard(company_id, month, group_by, only_forecast, ftype):
                         f"{body['error'].get('message') or body['error']}")
     return body.get("result") or {"rows": [], "totals": {}, "month_label": month}
 
-# ========= BUILD FORECAST ROWS (long format, all months) ==========
-def build_forecast_rows(company_id, company_name, months, group_by, only_forecast, ftype):
+# ========= BUILD FORECAST ROWS (long format, all months × all group-bys) ==========
+def build_forecast_rows(company_id, company_name, months, group_bys, only_forecast, ftype):
     """
-    One output row per (month, group entry). Filter values are carried as columns
-    so the sheet reflects every filter on the dashboard:
-        Company, Type, Group By, Only Forecast, Month, Month Label, Customer,
-        Forecast QTY, Forecast Value, OA QTY, OA Value, Growth %
+    One output row per (month, group-by, entry). Every dashboard filter is a
+    column, and the breakdowns are stacked with a "Group By" column so the sheet
+    behaves like the dashboard: filter Group By = "By Salesperson" (or Brand /
+    Team / Division / Customer) to see that exact breakdown.
+
+    Columns: Company, Type, Group By, Only Forecast, Month, Month Label, Name,
+             Forecast QTY, Forecast Value, OA QTY, OA Value, Growth %
+
+    Months are emitted newest → oldest.
     """
     type_label = {
         "local_foreign": "Local & Foreign",
         "local": "Local",
         "foreign": "Foreign",
     }.get(ftype, ftype)
-    group_label = {"customer": "By Customer",
-                   "salesperson": "By Salesperson",
-                   "buyer": "By Buyer"}.get(group_by, group_by)
+
+    # newest month first
+    months_sorted = sorted(months, key=lambda m: m["next_month"], reverse=True)
 
     out = []
-    for m in months:
+    for m in months_sorted:
         month = m["next_month"]
         month_label = m["next_month_label"]
-        data = fetch_forecast_dashboard(company_id, month, group_by, only_forecast, ftype)
-        rows = data.get("rows") or []
-        label_from_resp = data.get("month_label") or month_label
-        for r in rows:
-            out.append({
-                "Company":        company_name,
-                "Type":           type_label,
-                "Group By":       group_label,
-                "Only Forecast":  "Yes" if only_forecast else "No",
-                "Month":          month,
-                "Month Label":    label_from_resp,
-                "Customer":       r.get("name", ""),
-                "Forecast QTY":   r.get("forecast_qty", 0.0),
-                "Forecast Value": r.get("forecast_value", 0.0),
-                "OA QTY":         r.get("oa_qty", 0.0),
-                "OA Value":       r.get("oa_value", 0.0),
-                "Growth %":       r.get("growth_pct", 0.0),
-            })
-        print(f"📋 {month_label}: {len(rows)} rows")
+        for group_key, group_label in group_bys:
+            data = fetch_forecast_dashboard(company_id, month, group_key, only_forecast, ftype)
+            rows = data.get("rows") or []
+            label_from_resp = data.get("month_label") or month_label
+            for r in rows:
+                out.append({
+                    "Company":        company_name,
+                    "Type":           type_label,
+                    "Group By":       group_label,
+                    "Only Forecast":  "Yes" if only_forecast else "No",
+                    "Month":          month,
+                    "Month Label":    label_from_resp,
+                    "Name":           r.get("name", ""),
+                    "Forecast QTY":   r.get("forecast_qty", 0.0),
+                    "Forecast Value": r.get("forecast_value", 0.0),
+                    "OA QTY":         r.get("oa_qty", 0.0),
+                    "OA Value":       r.get("oa_value", 0.0),
+                    "Growth %":       r.get("growth_pct", 0.0),
+                })
+            print(f"📋 {month_label} / {group_label}: {len(rows)} rows")
     return out
 
 # ========= MAIN ==========
@@ -264,13 +282,14 @@ if __name__ == "__main__":
         print("❌ No forecast months found.")
         sys.exit(1)
     print(f"🗓️  {len(months)} months: {months[0]['next_month']} → {months[-1]['next_month']}")
+    print(f"🧩 group-bys: {', '.join(lbl for _, lbl in GROUP_BYS)}")
 
     forecast_rows = build_forecast_rows(
-        COMPANY_ID, company_name, months, GROUP_BY, ONLY_FORECAST, FORECAST_TYPE)
+        COMPANY_ID, company_name, months, GROUP_BYS, ONLY_FORECAST, FORECAST_TYPE)
     print(f"📊 Total forecast rows: {len(forecast_rows)}")
 
     cols = ["Company", "Type", "Group By", "Only Forecast", "Month", "Month Label",
-            "Customer", "Forecast QTY", "Forecast Value", "OA QTY", "OA Value", "Growth %"]
+            "Name", "Forecast QTY", "Forecast Value", "OA QTY", "OA Value", "Growth %"]
     df = pd.DataFrame(forecast_rows, columns=cols)
 
     # ========= PUSH TO GOOGLE SHEETS =========
