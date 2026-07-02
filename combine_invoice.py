@@ -291,27 +291,37 @@ def fetch_operation_details_by_sale_lines(allowed_company_ids, sale_line_ids,
     ids_list = list(set(sale_line_ids))
     for i in range(0, len(ids_list), CHUNK):
         chunk = ids_list[i:i + CHUNK]
+        # Filter mirrors Tapas's own "FG Daywise" report (operation.details with
+        # next_operation=Delivery, state not in (done, closed)). That report values
+        # each waiting/scheduled delivery line as qty * final_price and buckets it by
+        # action_date — which is exactly what this dump reproduces per day. Note this
+        # is scheduled/partial-delivery value, a different metric from the invoice
+        # overview page's del_value (completed deliveries); the two are not expected
+        # to match.
         domain = [
-            "&", "&",
+            "&", "&", "&",
             ["sale_order_line", "in", chunk],
             ["next_operation", "=", "Delivery"],
             ["state", "!=", "done"],
+            ["state", "!=", "closed"],
         ]
         if action_date_from and action_date_to:
             domain = [
-                "&", "&", "&", "&",
+                "&", "&", "&", "&", "&",
                 ["sale_order_line", "in", chunk],
                 ["next_operation", "=", "Delivery"],
                 ["state", "!=", "done"],
+                ["state", "!=", "closed"],
                 ["action_date", ">=", action_date_from],
                 ["action_date", "<", action_date_to],
             ]
         elif action_date_from:
             domain = [
-                "&", "&", "&",
+                "&", "&", "&", "&",
                 ["sale_order_line", "in", chunk],
                 ["next_operation", "=", "Delivery"],
                 ["state", "!=", "done"],
+                ["state", "!=", "closed"],
                 ["action_date", ">=", action_date_from],
             ]
         offset = 0
