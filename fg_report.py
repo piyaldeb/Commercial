@@ -4,32 +4,37 @@ FG Stock report -> Google Sheets.
 Source: operation.details.retrive_data_from_operation_details([[]]), the call the
 Odoo FG Store dashboard makes (captured in FG report.har, action 2591).
 
-Six tabs are written:
+Six tabs, laid out to match "Fg_Stock AS ON 15-08-2026 (1).xlsx":
 
-  FG Stock                  the dashboard's Excel-export layout (Fg_Stock.xlsx):
-                            33 columns, a Total row, sorted ascending by oa_id,
-                            plus the three derived columns below.
-  Goods Ready LC RCV        \\
-  Good Pending LC RCV        |  the 2x2 split of the master on LC Status x FG
-  Goods Ready LC Pending     |  Status, 19 columns each, no Total row.
-  Goods Pending LC Pending  /
-  SUMMERY                   Stock Value pivoted by LC/FG status against ageing.
+  FG Stock                     the dashboard's Excel-export layout (Fg_Stock.xlsx):
+                               33 columns, Total row, sorted ascending by oa_id,
+                               plus the five derived columns below.
+  Full Goods Ready LC RCV      \\
+  Partially ready LC RCV        |  the 2x2 split on LC Status x FG Status, each
+  Full Goods Ready LC Pending   |  with a banner and a subtotal row, 19 columns.
+  Partially ready LC Pending   /
+  SUMMERY                      Stock Value by LC/FG status against the DELIVERY
+                               DATE ageing buckets, with links to the four tabs.
 
-DERIVED COLUMNS. Reverse-engineered from "Fg_Stock AS ON 15-08-2026.xlsx" and
-verified to reproduce all 440 of its rows with zero mismatches:
+DERIVED COLUMNS. Reverse-engineered from the user's workbooks and verified to
+reproduce every row of both with zero mismatches:
 
   LC Status  "LC Received" when Invoice No is present, else "LC Pending".
-  FG Status  the LC status crossed with whether goods are still outstanding,
-             where outstanding means the 2dp-rounded Pending Value > 0:
+  FG Status  LC status crossed with whether goods are still outstanding, where
+             outstanding means the 2dp-rounded Pending Value > 0:
                  LC Received + none outstanding -> Full
                  LC Received + outstanding      -> Partial
                  LC Pending  + none outstanding -> Full OA
                  LC Pending  + outstanding      -> Goods in Production
-             Pending Value is used rather than Pending QTY because the source
-             workbook classifies rows with Pending QTY 0 but a residual value
-             (e.g. 0.05) as outstanding, and treats negative rounding noise
-             (-0.04) as settled. Testing on the rounded value reproduces that.
-  Ageing     Age bucketed <=5 / <=10 / <=20 / <=30 / <=60 / <=90 / >90.
+             Pending Value rather than Pending QTY: the source treats rows with
+             Pending QTY 0 but a residual 0.05 as outstanding, and negative
+             rounding noise (-0.04) as settled.
+  Age        days since goods-in (the endpoint's days_passed), bucketed by Ageing.
+  Age DD     days since the ED Date - negative when delivery is not yet due.
+  Ageing DD  Age DD bucketed, with a "Delivery not due" band for negative values.
+             SUMMERY pivots on this, not on Ageing.
+
+Both ageing scales use the same bands: <=5 / <=10 / <=20 / <=30 / <=60 / <=90 / >90.
 
 Four defects in the source Excel export are deliberately NOT reproduced - see
 EXPORT_FIXES.
@@ -44,7 +49,7 @@ import time
 import base64
 import logging
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 import requests
 from requests.exceptions import RequestException
@@ -74,8 +79,12 @@ SHEET_KEY = "1YRLVLKbrwXIziBAmtAzgEfEPH64Ycwu57ZZJrDO6aks"
 MASTER_WORKSHEET = "FG Stock"
 SUMMARY_WORKSHEET = "SUMMERY"
 
-# Tabs from the first two-sheet version of this script, superseded by FG Stock.
-OBSOLETE_WORKSHEETS = ["FG Store", "FG Store Details"]
+# Tabs from earlier revisions of this script, superseded by the ones above.
+OBSOLETE_WORKSHEETS = [
+    "FG Store", "FG Store Details",
+    "Goods Ready LC RCV", "Good Pending LC RCV",
+    "Goods Ready LC Pending", "Goods Pending LC Pending",
+]
 
 ALLOWED_COMPANY_IDS = [2, 1, 3]   # as the dashboard sends: Head Office, Zipper, Metal Trims
 DHAKA = timezone(timedelta(hours=6))
@@ -87,12 +96,13 @@ EXPORT_FIXES = """\
   2. LC Number leading zeros - the export coerced them to numbers and lost the
      zeros on 46 of 443 rows ('0000019525120040' -> 19525120040). Written as text.
   3. Date cells - the export stamped every date with a spurious 06:00:20 time
-     (a UTC+6 conversion artifact). Written as plain dates.
+     (a UTC+6 conversion artifact). Written as plain dates, so Age DD comes out
+     as whole days instead of the workbook's -50.25023148 style fractions.
   4. Half-up rounding - matches the export's JS toFixed(2) on the cells where
      Python's default banker's rounding would disagree (280.125 -> 280.13)."""
 
-# label, API field, kind. The first 33 are verbatim from Fg_Stock.xlsx; the last
-# three are derived (see module docstring).
+# label, API field, kind. The first 33 are verbatim from Fg_Stock.xlsx; the rest
+# are derived (see module docstring).
 COLUMNS = [
     ("OA",              "oa_name",           "text"),
     ("Order Date",      "date_order",        "date"),
@@ -127,6 +137,8 @@ COLUMNS = [
     ("Age",             "days_passed",       "age"),
     ("Invoice QTY",     "invoice_qty",       "qty"),
     ("Invoice Value",   "invoice_value",     "value"),
+    ("Age DD",          None,                "age"),
+    ("Ageing DD",       None,                "text"),
     ("Ageing",          None,                "text"),
     ("LC Status",       None,                "text"),
     ("FG Status",       None,                "text"),
@@ -134,41 +146,51 @@ COLUMNS = [
 LABELS = [label for label, _, _ in COLUMNS]
 KIND = {label: kind for label, _, kind in COLUMNS}
 
-# The category tabs, exactly as laid out in Fg_Stock AS ON 15-08-2026.xlsx:
-# the master's columns minus Ageing, in the same order.
+# The category tabs: the master's columns minus the ageing/derived extras, in the
+# workbook's order.
 CATEGORY_LABELS = [
     "OA", "Order Date", "ED Date", "Closing Date", "PI", "Customer", "Buyer",
     "Invoice No", "Invoice Date", "Sales Person", "Sales Team", "Item",
     "Pending QTY", "Pending Value", "Stock QTY", "Stock Value", "Age",
     "LC Status", "FG Status",
 ]
-# worksheet title, LC Status, FG Status. Titles verbatim from the workbook,
-# including its "Good Pending LC RCV" (not "Goods").
+# Columns carried in each category tab's subtotal row, as in the workbook.
+SUBTOTAL_LABELS = ["Pending QTY", "Pending Value", "Stock QTY", "Stock Value"]
+
+# worksheet title, LC Status, FG Status, banner, "Kindly attention". Text verbatim
+# from the workbook.
 CATEGORIES = [
-    ("Goods Ready LC RCV",       "LC Received", "Full"),
-    ("Good Pending LC RCV",      "LC Received", "Partial"),
-    ("Goods Ready LC Pending",   "LC Pending",  "Full OA"),
-    ("Goods Pending LC Pending", "LC Pending",  "Goods in Production"),
+    ("Full Goods Ready LC RCV", "LC Received", "Full",
+     "Max Delivery Date Passed – Full -goods Ready & LC Received, Delivery Pending",
+     " @ sales"),
+    ("Partially ready LC RCV", "LC Received", "Partial",
+     "Partial Goods Ready, Balance Under Production – LC Received",
+     " @ Sale & Production"),
+    ("Full Goods Ready LC Pending", "LC Pending", "Full OA",
+     "Max Delivery Date Passed – Full goods Ready but LC Pending",
+     " @ sales"),
+    ("Partially ready LC Pending", "LC Pending", "Goods in Production",
+     "Partial Goods Ready, Balance Under Production – LC Pending",
+     " @ Sale"),
 ]
 
 AGEING_BUCKETS = [
-    (5,           "01-05 DAYS"),
-    (10,          "06-10 DAYS"),
-    (20,          "11-20 DAYS"),
-    (30,          "21-30 DAYS"),
-    (60,          "31-60 DAYS"),
-    (90,          "61-90 DAYS"),
+    (5,            "01-05 DAYS"),
+    (10,           "06-10 DAYS"),
+    (20,           "11-20 DAYS"),
+    (30,           "21-30 DAYS"),
+    (60,           "31-60 DAYS"),
+    (90,           "61-90 DAYS"),
     (float("inf"), ">90 DAYS"),
 ]
 AGEING_ORDER = [label for _, label in AGEING_BUCKETS]
-# SUMMERY row hierarchy: parent LC Status followed by its FG Statuses.
-SUMMARY_ROWS = [
-    ("LC Pending",  None),
-    ("LC Pending",  "Full OA"),
-    ("LC Pending",  "Goods in Production"),
-    ("LC Received", None),
-    ("LC Received", "Full"),
-    ("LC Received", "Partial"),
+NOT_DUE = "Delivery not due"
+# SUMMERY pivots on Ageing DD, so the not-due band is a column of its own.
+SUMMARY_COLUMNS = AGEING_ORDER + [NOT_DUE]
+# Parent LC Status followed by its FG Statuses, in the workbook's order.
+SUMMARY_GROUPS = [
+    ("LC Received", "LC received", ["Full", "Partial"]),
+    ("LC Pending",  "LC Pending",  ["Full OA", "Goods in Production"]),
 ]
 
 session = requests.Session()
@@ -205,6 +227,12 @@ def ageing_bucket(age):
         if age <= limit:
             return label
     return AGEING_ORDER[-1]
+
+
+def ageing_dd_bucket(age_dd):
+    if age_dd == "" or age_dd is None:
+        return ""
+    return NOT_DUE if age_dd < 0 else ageing_bucket(age_dd)
 
 
 # ========= RETRY ==========
@@ -282,7 +310,7 @@ def fetch_stock():
 
 
 # ========= TABLES ==========
-def build_master(records):
+def build_master(records, as_of):
     """Header + Total + data, the Fg_Stock.xlsx shape plus the derived columns."""
     data = []
     for rec in records:
@@ -300,9 +328,16 @@ def build_master(records):
             else:
                 row[label] = round2(v)
 
-        # Derived. Evaluated on the rounded Pending Value so that residual
-        # fractions and negative noise classify the way the source workbook does.
+        # Days since the expected delivery date; negative until it falls due.
+        try:
+            row["Age DD"] = (as_of - date.fromisoformat(row["ED Date"])).days
+        except ValueError:
+            row["Age DD"] = ""
+        row["Ageing DD"] = ageing_dd_bucket(row["Age DD"])
         row["Ageing"] = ageing_bucket(row["Age"])
+
+        # Evaluated on the rounded Pending Value so that residual fractions and
+        # negative noise classify the way the source workbook does.
         row["LC Status"] = "LC Received" if row["Invoice No"] else "LC Pending"
         outstanding = (row["Pending Value"] or 0) > 0
         if row["LC Status"] == "LC Received":
@@ -321,28 +356,43 @@ def build_master(records):
 
 
 def build_category(master_df, lc_status, fg_status):
-    """One of the four splits: no Total row, 19 columns, oldest stock first."""
+    """One of the four splits: 19 columns, oldest stock first."""
     body = master_df.iloc[1:]
     sel = body[(body["LC Status"] == lc_status) & (body["FG Status"] == fg_status)]
     sel = sel.sort_values("Age", ascending=False, kind="stable")
     return sel[CATEGORY_LABELS].reset_index(drop=True)
 
 
-def build_summary(master_df):
-    """Stock Value by LC Status / FG Status against the ageing buckets."""
+def build_summary(master_df, tab_gids):
+    """Stock Value by LC Status / FG Status against the DELIVERY DATE ageing
+    buckets, mirroring the workbook's SUMMERY pivot."""
     body = master_df.iloc[1:]
-    header = ["Sum of Stock Value"] + AGEING_ORDER + ["Grand Total"]
+    cat_by_fg = {fg: (title, banner, attn) for title, _, fg, banner, attn in CATEGORIES}
+
+    def line(sel, label, particulars, attn="", tab=None):
+        cells = [round2(sel[sel["Ageing DD"] == c]["Stock Value"].sum())
+                 for c in SUMMARY_COLUMNS]
+        link = ""
+        if tab and tab in tab_gids:
+            link = f'=HYPERLINK("#gid={tab_gids[tab]}","{tab}")'
+        return ([particulars, label] + cells
+                + [round2(sel["Stock Value"].sum()), attn, link])
+
     rows = []
-    for lc, fg in SUMMARY_ROWS:
-        sel = body[body["LC Status"] == lc] if fg is None else \
-            body[(body["LC Status"] == lc) & (body["FG Status"] == fg)]
-        label = lc if fg is None else f"    {fg}"
-        cells = [round2(sel[sel["Ageing"] == b]["Stock Value"].sum()) for b in AGEING_ORDER]
-        rows.append([label] + cells + [round2(sel["Stock Value"].sum())])
-    rows.append(["Grand Total"]
-                + [round2(body[body["Ageing"] == b]["Stock Value"].sum()) for b in AGEING_ORDER]
-                + [round2(body["Stock Value"].sum())])
+    for lc, particulars, fg_list in SUMMARY_GROUPS:
+        rows.append(line(body[body["LC Status"] == lc], lc, particulars))
+        for fg in fg_list:
+            title, banner, attn = cat_by_fg[fg]
+            rows.append(line(body[body["FG Status"] == fg], fg, banner, attn, title))
+    rows.append(line(body, "Grand Total", "Grand Total"))
+
+    header = (["Particulars", "Row Labels"] + SUMMARY_COLUMNS
+              + ["Grand Total", "Kindly attention", "sheet link"])
     return pd.DataFrame(rows, columns=header)
+
+
+SUMMARY_KINDS = {"Particulars": "text", "Row Labels": "text",
+                 "Kindly attention": "text", "sheet link": "formula"}
 
 
 # ========= GOOGLE SHEETS ==========
@@ -381,17 +431,31 @@ NUMBER_PATTERNS = {"date": {"type": "DATE", "pattern": "yyyy-mm-dd"},
                    "value": {"type": "NUMBER", "pattern": "#,##0.00"},
                    "age":  {"type": "NUMBER", "pattern": "0"}}
 
+BLUE = {"red": 0.10, "green": 0.31, "blue": 0.58}
+PALE = {"red": 0.85, "green": 0.89, "blue": 0.96}
 
-def push(sheet, title, df, kinds, total_row=False):
-    """Write one tab. `kinds` maps column label -> kind for formatting."""
+
+def get_worksheet(sheet, title, rows, cols):
     try:
-        ws = sheet.worksheet(title)
+        return sheet.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sheets_call(sheet.add_worksheet, title=title,
-                         rows=max(1000, len(df) + 50), cols=max(40, len(df.columns) + 2))
         log.info(f"Created worksheet '{title}'")
+        return sheets_call(sheet.add_worksheet, title=title, rows=rows, cols=cols)
 
-    need_rows, need_cols = max(len(df) + 50, 200), max(len(df.columns) + 2, 40)
+
+def push(sheet, title, df, kinds, header_row=1, pre_cells=None,
+         bold_rows=(), freeze=None):
+    """Write one tab.
+
+    header_row  1-indexed row the column headers land on; data follows.
+    pre_cells   [(a1_range, values_2d)] written above the frame.
+    bold_rows   1-indexed rows to bold and shade (e.g. a Total or subtotal row).
+    """
+    ws = get_worksheet(sheet, title, max(1000, len(df) + header_row + 50),
+                       max(40, len(df.columns) + 2))
+
+    need_rows = max(len(df) + header_row + 50, 200)
+    need_cols = max(len(df.columns) + 2, 40)
     if ws.row_count < need_rows or ws.col_count < need_cols:
         sheets_call(ws.resize, rows=max(ws.row_count, need_rows),
                     cols=max(ws.col_count, need_cols))
@@ -412,42 +476,60 @@ def push(sheet, title, df, kinds, total_row=False):
         {"updateCells": {"range": {"sheetId": sid}, "fields": "userEnteredFormat"}}]})
 
     # Text format must land BEFORE the values: USER_ENTERED honours an existing
-    # TEXT format, and that is what keeps the leading zeros on LC numbers.
+    # TEXT format, and that is what keeps the leading zeros on LC numbers. The
+    # 'formula' kind is skipped so HYPERLINK() is not stored as literal text.
     text_reqs = [fmt(i, {"type": "TEXT"})
                  for i, c in enumerate(df.columns) if kinds.get(c) == "text"]
     if text_reqs:
         sheets_call(sheet.batch_update, {"requests": text_reqs})
 
-    sheets_call(set_with_dataframe, ws, df, resize=False)
+    for a1, values in (pre_cells or []):
+        sheets_call(ws.update, values, a1, value_input_option="USER_ENTERED")
+
+    sheets_call(set_with_dataframe, ws, df, row=header_row, resize=False)
 
     reqs = [fmt(i, NUMBER_PATTERNS[kinds[c]])
             for i, c in enumerate(df.columns) if kinds.get(c) in NUMBER_PATTERNS]
     reqs.append({"repeatCell": {
-        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1},
+        "range": {"sheetId": sid, "startRowIndex": header_row - 1, "endRowIndex": header_row},
         "cell": {"userEnteredFormat": {
             "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
-            "backgroundColor": {"red": 0.10, "green": 0.31, "blue": 0.58},
-            "horizontalAlignment": "CENTER"}},
+            "backgroundColor": BLUE, "horizontalAlignment": "CENTER"}},
         "fields": "userEnteredFormat(textFormat,backgroundColor,horizontalAlignment)"}})
-    if total_row:
+    for r in bold_rows:
         reqs.append({"repeatCell": {
-            "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": 2},
-            "cell": {"userEnteredFormat": {
-                "textFormat": {"bold": True},
-                "backgroundColor": {"red": 0.85, "green": 0.89, "blue": 0.96}}},
+            "range": {"sheetId": sid, "startRowIndex": r - 1, "endRowIndex": r},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
+                                           "backgroundColor": PALE}},
             "fields": "userEnteredFormat(textFormat,backgroundColor)"}})
     reqs.append({"updateSheetProperties": {
         "properties": {"sheetId": sid,
-                       "gridProperties": {"frozenRowCount": 2 if total_row else 1}},
+                       "gridProperties": {"frozenRowCount": freeze if freeze is not None else header_row}},
         "fields": "gridProperties.frozenRowCount"}})
     sheets_call(sheet.batch_update, {"requests": reqs})
 
-    log.info(f"  '{title}': {len(df) - (1 if total_row else 0)} rows x {len(df.columns)} cols")
+    log.info(f"  '{title}': {len(df)} rows x {len(df.columns)} cols")
+    return ws
 
 
-def push_summary(sheet, df):
-    kinds = {c: ("text" if i == 0 else "value") for i, c in enumerate(df.columns)}
-    push(sheet, SUMMARY_WORKSHEET, df, kinds, total_row=False)
+def push_category(sheet, title, df, banner):
+    """Banner on row 1, subtotals on row 2, headers on row 3, data from row 4."""
+    sub = [""] * len(CATEGORY_LABELS)
+    for label in SUBTOTAL_LABELS:
+        sub[CATEGORY_LABELS.index(label)] = round2(
+            pd.to_numeric(df[label], errors="coerce").fillna(0).sum())
+    return push(sheet, title, df, KIND, header_row=3,
+                pre_cells=[("A1", [[banner]]), ("A2", [sub])],
+                bold_rows=(1, 2), freeze=3)
+
+
+def push_summary(sheet, df, as_of):
+    title = (f" Finish Goods status as on {as_of.day} {as_of:%B %Y} "
+             f"( Ageing delivery date wise)")
+    kinds = {c: SUMMARY_KINDS.get(c, "value") for c in df.columns}
+    return push(sheet, SUMMARY_WORKSHEET, df, kinds, header_row=5,
+                pre_cells=[("A2", [[title]]), ("B4", [["Sum of Stock Value", "Column Labels"]])],
+                bold_rows=(2, 6, 9, 12), freeze=5)
 
 
 def drop_obsolete(sheet):
@@ -468,40 +550,48 @@ def main():
         raise SystemExit(f"Missing env vars: {', '.join(missing)}")
 
     login()
-    master = build_master(fetch_stock())
+    as_of = datetime.now(DHAKA).date()
+    master = build_master(fetch_stock(), as_of)
     body = master.iloc[1:]
 
-    categories = [(title, build_category(master, lc, fg)) for title, lc, fg in CATEGORIES]
-    summary = build_summary(master)
+    categories = [(title, banner, build_category(master, lc, fg))
+                  for title, lc, fg, banner, _ in CATEGORIES]
 
     totals = master.iloc[0]
     log.info("Totals: " + "  ".join(
         f"{lbl}={totals[lbl]:,.2f}" for lbl, _, kind in COLUMNS if kind in ("qty", "value")))
-    log.info("Split: " + "  ".join(f"{t}={len(d)}" for t, d in categories)
-             + f"  (sum={sum(len(d) for _, d in categories)} of {len(body)})")
+    log.info("Split: " + "  ".join(f"{t}={len(d)}" for t, _, d in categories)
+             + f"  (sum={sum(len(d) for _, _, d in categories)} of {len(body)})")
+    log.info("Ageing DD: " + "  ".join(
+        f"{c}={(body['Ageing DD'] == c).sum()}" for c in SUMMARY_COLUMNS))
 
-    covered = sum(len(d) for _, d in categories)
+    covered = sum(len(d) for _, _, d in categories)
     if covered != len(body):
         log.info(f"WARNING: {len(body) - covered} rows fall outside the four categories")
+    no_ed = (body["Age DD"] == "").sum()
+    if no_ed:
+        log.info(f"NOTE: {no_ed} rows have no ED Date, so Age DD / Ageing DD are blank")
 
     if os.getenv("FG_REPORT_DRY_RUN"):
         out = os.getenv("FG_REPORT_DRY_RUN_PATH", "fg_stock_dryrun.csv")
         master.to_csv(out, index=False)
-        for title, d in categories:
+        for title, _, d in categories:
             d.to_csv(out.replace(".csv", f" - {title}.csv"), index=False)
-        summary.to_csv(out.replace(".csv", " - SUMMERY.csv"), index=False)
+        build_summary(master, {}).to_csv(out.replace(".csv", " - SUMMERY.csv"), index=False)
         log.info(f"DRY RUN: wrote {out} and 5 companions, skipped Google Sheets")
         return
 
     client = get_gspread_client()
     sheet = sheets_call(client.open_by_key, SHEET_KEY)
 
-    push(sheet, MASTER_WORKSHEET, master, KIND, total_row=True)
-    for title, d in categories:
-        push(sheet, title, d, KIND, total_row=False)
-    push_summary(sheet, summary)
+    push(sheet, MASTER_WORKSHEET, master, KIND, header_row=1, bold_rows=(2,), freeze=2)
+    # Category tabs first: SUMMERY links to them by sheet id.
+    tab_gids = {}
+    for title, banner, d in categories:
+        tab_gids[title] = push_category(sheet, title, d, banner).id
+    push_summary(sheet, build_summary(master, tab_gids), as_of)
     # Drop last: the tabs just written guarantee the spreadsheet still has a
-    # sheet left, so neither delete can hit the last-tab guard.
+    # sheet left, so no delete can hit the last-tab guard.
     drop_obsolete(sheet)
 
     log.info(f"Done at {datetime.now(DHAKA):%Y-%m-%d %H:%M} Asia/Dhaka")
