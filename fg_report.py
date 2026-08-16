@@ -1,21 +1,20 @@
 """
-FG Store report → Google Sheets.
+FG Stock report -> Google Sheets, in the exact layout of the FG Store
+dashboard's "Export to Excel" output (Fg_Stock.xlsx).
 
-Replays exactly the two data calls the Odoo "FG Store" dashboard makes
-(captured in FG report.har, action_id 2591 / taps_manufacturing.actions_fg_store_dashboard):
+Source: operation.details.retrive_data_from_operation_details([]), the same call
+the dashboard makes (captured in FG report.har, action 2591). The endpoint
+returns 42 fields per OA; the Excel export keeps 33 of them, drops the internal
+id/company/price fields, rounds money to 2dp and sorts by OA id.
 
-  1. operation.details.retrieve_fg_store_datas([1, 3], date_from, date_to)
-       -> movement per OA + item: opening / received / delivery / disposal / closing
-          (qty and value) plus LC status. The HAR captured 2026-08-01 -> 2026-08-16,
-          i.e. month-to-date, which is what this script reproduces each run.
+Layout reproduced from Fg_Stock.xlsx, verified row-for-row against the HAR
+captured 10 seconds after that export:
+  row 1  - 33 headers, labels verbatim (including the source's "Recived" spelling)
+  row 2  - Total row across the qty/value columns
+  row 3+ - one row per OA, ascending oa_id
 
-  2. operation.details.retrive_data_from_operation_details([])
-       -> per-OA stock detail: buyer, customer, salesperson, team, region, core
-          leader, product, order/received/delivered/pending/stock qty+value,
-          invoice + LC references and ageing (days_passed).
-
-Both payloads are written verbatim - no filtering, no re-aggregation. Only the
-column headers are humanised; every value is exactly what the endpoint returned.
+Four defects in the source export are deliberately NOT reproduced - see
+EXPORT_FIXES below.
 
 Target sheet: https://docs.google.com/spreadsheets/d/1YRLVLKbrwXIziBAmtAzgEfEPH64Ycwu57ZZJrDO6aks
 """
@@ -26,6 +25,7 @@ import json
 import time
 import base64
 import logging
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -52,18 +52,89 @@ USERNAME = os.getenv("ODOO_USERNAME")
 PASSWORD = os.getenv("ODOO_PASSWORD")
 
 SHEET_KEY = "1YRLVLKbrwXIziBAmtAzgEfEPH64Ycwu57ZZJrDO6aks"
-STORE_WORKSHEET = "FG Store"
-DETAIL_WORKSHEET = "FG Store Details"
+WORKSHEET = "FG Stock"
 
-# Exactly as in the HAR: the dashboard asks for Zipper (1) + Metal Trims (3),
-# with Head Office (2) present in allowed_company_ids for record-rule purposes.
-COMPANY_IDS = [1, 3]
-ALLOWED_COMPANY_IDS = [2, 1, 3]
+# Tabs written by the previous two-sheet version of this script, superseded by
+# the single Fg_Stock layout. Dropped on each run so the sheet stays clean.
+OBSOLETE_WORKSHEETS = ["FG Store", "FG Store Details"]
 
-DHAKA = timezone(timedelta(hours=6))  # Asia/Dhaka, no DST
+ALLOWED_COMPANY_IDS = [2, 1, 3]   # as the dashboard sends: Head Office, Zipper, Metal Trims
+DHAKA = timezone(timedelta(hours=6))
+
+EXPORT_FIXES = """\
+  1. Total row alignment - the source export writes the totals two columns to the
+     left of their headers (the Order QTY total lands under 'Item'). Here each
+     total sits under its own column. 'Age' is left blank, as in the source.
+  2. LC Number leading zeros - the export coerced them to numbers and lost the
+     zeros on 46 of 443 rows ('0000019525120040' -> 19525120040). Written as text.
+  3. Date cells - the export stamped every date with a spurious 06:00:20 time
+     (a UTC+6 conversion artifact). Written as plain dates.
+  4. Half-up rounding - matches the export's JS toFixed(2) on the 6 cells where
+     Python's default banker's rounding would disagree (280.125 -> 280.13)."""
+
+# label, API field, kind. Order and labels are verbatim from Fg_Stock.xlsx.
+COLUMNS = [
+    ("OA",              "oa_name",           "text"),
+    ("Order Date",      "date_order",        "date"),
+    ("ED Date",         "ed_date",           "date"),
+    ("Closing Date",    "closing_date",      "date"),
+    ("Sample",          "sample",            "text"),
+    ("PI",              "pi",                "text"),
+    ("Customer",        "customer_name",     "text"),
+    ("Buyer",           "buyer_name",        "text"),
+    ("Invoice No",      "invoice_number",    "text"),
+    ("Invoice Date",    "invoice_date",      "date"),
+    ("LC Number",       "lc_number",         "text"),
+    ("LC Date",         "lc_date",           "date"),
+    ("Sales Person",    "sales_person_name", "text"),
+    ("Sales Team",      "sales_team",        "text"),
+    ("Region",          "region_name",       "text"),
+    ("DSM",             "core_leader_name",  "text"),
+    ("Item",            "fg_categ_type",     "text"),
+    ("Product",         "product_id",        "text"),
+    ("Order QTY",       "order_qty",         "qty"),
+    ("Order Value",     "order_value",       "value"),
+    ("Recived QTY",     "received_qty",      "qty"),
+    ("Recived Value",   "received_value",    "value"),
+    ("Goods In Date",   "goods_in_date",     "date"),
+    ("Delivered QTY",   "delivered_qty",     "qty"),
+    ("Delivered Value", "delivered_value",   "value"),
+    ("Delivered Date",  "delivery_date",     "date"),
+    ("Pending QTY",     "pending_qty",       "qty"),
+    ("Pending Value",   "pending_value",     "value"),
+    ("Stock QTY",       "stock_qty",         "qty"),
+    ("Stock Value",     "stock_value",       "value"),
+    ("Age",             "days_passed",       "age"),
+    ("Invoice QTY",     "invoice_qty",       "qty"),
+    ("Invoice Value",   "invoice_value",     "value"),
+]
+LABELS = [label for label, _, _ in COLUMNS]
 
 session = requests.Session()
 USER_ID = None
+
+
+# ========= VALUE COERCION ==========
+def round2(v):
+    """2dp, half away from zero - what the export's JS toFixed(2) does. Python's
+    built-in round() uses banker's rounding and disagrees on exact .xx5 values."""
+    if v is None or v == "":
+        return ""
+    return float(Decimal(float(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def clean_text(v):
+    """Collapse whitespace runs and strip, as the export does. Source data has
+    entries like 'MIRAS  FASHION  LTD' and 'KANIZ GARMENTS LIMITED\\n'."""
+    if v is None or v is False:
+        return ""
+    return " ".join(str(v).split())
+
+
+def clean_date(v):
+    if not v:
+        return ""
+    return str(v)[:10]
 
 
 # ========= RETRY ==========
@@ -93,20 +164,13 @@ def login():
     log.info(f"Logged in to Odoo (uid={USER_ID})")
 
 
-def odoo_context():
-    return {
-        "lang": "en_US",
-        "tz": "Asia/Dhaka",
-        "uid": USER_ID,
-        "allowed_company_ids": ALLOWED_COMPANY_IDS,
-    }
-
-
 def call_kw(model, method, args, timeout=900):
     payload = {
         "jsonrpc": "2.0", "method": "call",
         "params": {"model": model, "method": method, "args": args,
-                   "kwargs": {"context": odoo_context()}},
+                   "kwargs": {"context": {"lang": "en_US", "tz": "Asia/Dhaka",
+                                          "uid": USER_ID,
+                                          "allowed_company_ids": ALLOWED_COMPANY_IDS}}},
     }
     r = retry_request(session.post, f"{ODOO_URL}/web/dataset/call_kw/{model}/{method}",
                       json=payload, timeout=timeout)
@@ -118,106 +182,46 @@ def call_kw(model, method, args, timeout=900):
     return body.get("result")
 
 
-def date_range():
-    """Month-to-date in Asia/Dhaka, matching the range captured in the HAR
-    (2026-08-01 -> 2026-08-16). Override with FG_DATE_FROM / FG_DATE_TO."""
-    today = datetime.now(DHAKA).date()
-    date_from = os.getenv("FG_DATE_FROM") or today.replace(day=1).isoformat()
-    date_to = os.getenv("FG_DATE_TO") or today.isoformat()
-    return date_from, date_to
-
-
-# ========= DATASET 1: FG Store movement ==========
-STORE_COLS = [
-    ("oa",             "OA"),
-    ("item",           "Item"),
-    ("in_date",        "In Date"),
-    ("opening_qty",    "Opening QTY"),
-    ("opening_value",  "Opening Value"),
-    ("received_qty",   "Received QTY"),
-    ("received_value", "Received Value"),
-    ("delivery_qty",   "Delivery QTY"),
-    ("delivery_value", "Delivery Value"),
-    ("disposal_qty",   "Disposal QTY"),
-    ("disposal_value", "Disposal Value"),
-    ("closing_qty",    "Closing QTY"),
-    ("closing_value",  "Closing Value"),
-    ("lc_status",      "LC Status"),
-]
-STORE_TEXT = {"oa", "item", "lc_status"}
-STORE_DATE = {"in_date"}
-
-
-def fetch_fg_store(date_from, date_to):
-    rows = call_kw("operation.details", "retrieve_fg_store_datas",
-                   [COMPANY_IDS, date_from, date_to]) or []
-    log.info(f"FG Store movement {date_from} -> {date_to}: {len(rows)} rows")
-    return rows
-
-
-# ========= DATASET 2: per-OA stock detail ==========
-DETAIL_COLS = [
-    ("goods_in_date",     "Goods In Date"),
-    ("buyer_id",          "Buyer ID"),
-    ("buyer_name",        "Buyer"),
-    ("company_id",        "Company ID"),
-    ("company_name",      "Company"),
-    ("customer_id",       "Customer ID"),
-    ("customer_name",     "Customer"),
-    ("fg_categ_type",     "FG Category"),
-    ("oa_id",             "OA ID"),
-    ("oa_name",           "OA"),
-    ("date_order",        "Order Date"),
-    ("ed_date",           "ED Date"),
-    ("closing_date",      "Closing Date"),
-    ("sample",            "Sample"),
-    ("pi",                "PI"),
-    ("invoice_number",    "Invoice Number"),
-    ("invoice_date",      "Invoice Date"),
-    ("lc_number",         "LC Number"),
-    ("lc_date",           "LC Date"),
-    ("delivery_date",     "Delivery Date"),
-    ("sales_person_id",   "Salesperson ID"),
-    ("sales_person_name", "Salesperson"),
-    ("sales_team",        "Sales Team"),
-    ("region_id",         "Region ID"),
-    ("region_name",       "Region"),
-    ("core_leader_id",    "Core Leader ID"),
-    ("core_leader_name",  "Core Leader"),
-    ("product_id",        "Product"),
-    ("order_qty",         "Order QTY"),
-    ("order_value",       "Order Value"),
-    ("received_qty",      "Received QTY"),
-    ("received_value",    "Received Value"),
-    ("delivered_qty",     "Delivered QTY"),
-    ("delivered_value",   "Delivered Value"),
-    ("pending_qty",       "Pending QTY"),
-    ("pending_value",     "Pending Value"),
-    ("stock_qty",         "Stock QTY"),
-    ("stock_value",       "Stock Value"),
-    ("days_passed",       "Days Passed"),
-    ("invoice_qty",       "Invoice QTY"),
-    ("invoice_value",     "Invoice Value"),
-    ("final_price",       "Final Price"),
-]
-# Identifier-ish columns that must stay verbatim strings. lc_number in particular
-# carries leading zeros ("0000019525120040") that Sheets would otherwise eat.
-DETAIL_TEXT = {"buyer_name", "company_name", "customer_name", "fg_categ_type",
-               "oa_name", "sample", "pi", "invoice_number", "lc_number",
-               "sales_person_name", "sales_team", "region_name",
-               "core_leader_name", "product_id"}
-DETAIL_DATE = {"goods_in_date", "date_order", "ed_date", "closing_date",
-               "invoice_date", "lc_date", "delivery_date"}
-DETAIL_INT = {"buyer_id", "company_id", "customer_id", "oa_id",
-              "sales_person_id", "region_id", "core_leader_id", "days_passed"}
-
-
-def fetch_detail():
+def fetch_stock():
+    """Rows sorted by ascending oa_id - the dashboard's JS iterates the datas
+    object by its integer-like keys, which is the order the export preserves."""
     result = call_kw("operation.details", "retrive_data_from_operation_details", [[]]) or {}
     datas = result.get("datas") or {}
-    rows = [row for group in datas.values() for row in (group or [])]
-    log.info(f"FG Store details: {len(rows)} rows across {len(datas)} OAs")
-    return rows
+    rows = []
+    for oa_id, group in datas.items():
+        for rec in (group or []):
+            rows.append((int(oa_id), rec))
+    rows.sort(key=lambda t: t[0])
+    log.info(f"Fetched {len(rows)} OA rows")
+    return [rec for _, rec in rows]
+
+
+# ========= TABLE ==========
+def build_frame(records):
+    """Header + Total + data, exactly the Fg_Stock.xlsx shape."""
+    data = []
+    for rec in records:
+        row = {}
+        for label, key, kind in COLUMNS:
+            v = rec.get(key)
+            if kind == "text":
+                row[label] = clean_text(v)
+            elif kind == "date":
+                row[label] = clean_date(v)
+            elif kind == "age":
+                row[label] = int(v) if isinstance(v, (int, float)) else ""
+            else:
+                row[label] = round2(v)
+        data.append(row)
+
+    # Totals from the raw values, then rounded once - matching the export.
+    total = {label: "" for label in LABELS}
+    total["OA"] = "Total"
+    for label, key, kind in COLUMNS:
+        if kind in ("qty", "value"):
+            total[label] = round2(sum(rec.get(key) or 0 for rec in records))
+
+    return pd.DataFrame([total] + data, columns=LABELS)
 
 
 # ========= GOOGLE SHEETS ==========
@@ -231,106 +235,99 @@ def get_gspread_client():
 
     scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds_dict = None
-
     creds_json = os.getenv("GOOGLE_SHEET_CRED_JSON")
     if creds_json:
         creds_dict = json.loads(creds_json)
     else:
-        creds_raw = os.getenv("GOOGLE_CREDS_BASE64")
+        creds_raw = (os.getenv("GOOGLE_CREDS_BASE64") or "").strip()
         if creds_raw:
-            raw = creds_raw.strip()
             try:
-                creds_dict = json.loads(raw)
+                creds_dict = json.loads(creds_raw)
             except json.JSONDecodeError:
-                padded = raw + "=" * (-len(raw) % 4)
+                padded = creds_raw + "=" * (-len(creds_raw) % 4)
                 creds_dict = json.loads(base64.b64decode(padded).decode("utf-8"))
-
     if creds_dict is None:
         raise Exception("No Google credentials found "
                         "(service_account.json / GOOGLE_SHEET_CRED_JSON / GOOGLE_CREDS_BASE64).")
 
-    # Printed so the first run tells you which address the target sheet must be shared with.
     log.info(f"Google service account: {creds_dict.get('client_email')}")
     creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scopes)
     return gspread.authorize(creds)
 
 
-def build_df(rows, colspec):
-    """Frame with every column in the endpoint's own order, values untouched."""
-    df = pd.DataFrame(rows, columns=[k for k, _ in colspec])
-    df.columns = [label for _, label in colspec]
-    return df
+def drop_obsolete(sheet):
+    existing = {ws.title: ws for ws in sheet.worksheets()}
+    for title in OBSOLETE_WORKSHEETS:
+        ws = existing.get(title)
+        # Never delete the last remaining tab - Sheets rejects it anyway.
+        if ws is not None and len(existing) > 1:
+            sheet.del_worksheet(ws)
+            existing.pop(title)
+            log.info(f"Removed obsolete worksheet '{title}'")
 
 
-def push(sheet, title, df, colspec, text_keys, date_keys, int_keys=frozenset()):
+def push(sheet, df):
     try:
-        ws = sheet.worksheet(title)
+        ws = sheet.worksheet(WORKSHEET)
     except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=title, rows=max(1000, len(df) + 50),
-                                 cols=max(26, len(df.columns) + 2))
-        log.info(f"Created worksheet '{title}'")
+        ws = sheet.add_worksheet(title=WORKSHEET, rows=max(1000, len(df) + 50),
+                                 cols=max(40, len(LABELS) + 2))
+        log.info(f"Created worksheet '{WORKSHEET}'")
 
-    need_rows = max(len(df) + 50, 100)
-    need_cols = max(len(df.columns) + 2, 26)
+    need_rows, need_cols = max(len(df) + 50, 200), max(len(LABELS) + 2, 40)
     if ws.row_count < need_rows or ws.col_count < need_cols:
         ws.resize(rows=max(ws.row_count, need_rows), cols=max(ws.col_count, need_cols))
 
     ws.clear()
-
     sid = ws.id
-    keys = [k for k, _ in colspec]
 
-    def col_range(idx, from_data_row=True):
-        return {"sheetId": sid, "startRowIndex": 1 if from_data_row else 0,
-                "startColumnIndex": idx, "endColumnIndex": idx + 1}
+    def fmt(idx, number_format, start_row=1):
+        return {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": start_row,
+                      "startColumnIndex": idx, "endColumnIndex": idx + 1},
+            "cell": {"userEnteredFormat": {"numberFormat": number_format}},
+            "fields": "userEnteredFormat.numberFormat"}}
 
-    def fmt_req(idx, number_format):
-        return {"repeatCell": {"range": col_range(idx),
-                               "cell": {"userEnteredFormat": {"numberFormat": number_format}},
-                               "fields": "userEnteredFormat.numberFormat"}}
-
-    # clear() wipes values, not formatting - reset so a previous run's formats
-    # can't reinterpret this run's values (e.g. numbers rendered as dates).
+    # clear() wipes values but not formatting; reset so last run's formats can't
+    # reinterpret this run's values.
     sheet.batch_update({"requests": [
-        {"updateCells": {"range": {"sheetId": sid}, "fields": "userEnteredFormat"}}
-    ]})
+        {"updateCells": {"range": {"sheetId": sid}, "fields": "userEnteredFormat"}}]})
 
-    # Plain-text format must land BEFORE the values: USER_ENTERED input honours an
-    # existing TEXT format, which is what preserves leading zeros in LC numbers.
-    text_reqs = [fmt_req(i, {"type": "TEXT"})
-                 for i, k in enumerate(keys) if k in text_keys]
-    if text_reqs:
-        sheet.batch_update({"requests": text_reqs})
+    # Text format must land BEFORE the values: USER_ENTERED honours an existing
+    # TEXT format, and that is what keeps the leading zeros on LC numbers.
+    text_reqs = [fmt(i, {"type": "TEXT"})
+                 for i, (_, _, kind) in enumerate(COLUMNS) if kind == "text"]
+    sheet.batch_update({"requests": text_reqs})
 
     set_with_dataframe(ws, df, resize=False)
 
-    # Numeric / date presentation for everything else.
-    reqs = []
-    for i, k in enumerate(keys):
-        if k in text_keys:
-            continue
-        if k in date_keys:
-            reqs.append(fmt_req(i, {"type": "DATE", "pattern": "yyyy-mm-dd"}))
-        elif k in int_keys:
-            reqs.append(fmt_req(i, {"type": "NUMBER", "pattern": "0"}))
-        elif pd.api.types.is_numeric_dtype(df[df.columns[i]]):
-            reqs.append(fmt_req(i, {"type": "NUMBER", "pattern": "#,##0.####"}))
+    patterns = {"date": {"type": "DATE", "pattern": "yyyy-mm-dd"},
+                "qty":  {"type": "NUMBER", "pattern": "#,##0.##"},
+                "value": {"type": "NUMBER", "pattern": "#,##0.00"},
+                "age":  {"type": "NUMBER", "pattern": "0"}}
+    reqs = [fmt(i, patterns[kind])
+            for i, (_, _, kind) in enumerate(COLUMNS) if kind in patterns]
+
+    header_style = {"textFormat": {"bold": True},
+                    "backgroundColor": {"red": 0.10, "green": 0.31, "blue": 0.58},
+                    "horizontalAlignment": "CENTER"}
+    header_style["textFormat"]["foregroundColor"] = {"red": 1, "green": 1, "blue": 1}
     reqs.append({"repeatCell": {
         "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1},
-        "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
-                                       "backgroundColor": {"red": 0.85, "green": 0.89, "blue": 0.96}}},
+        "cell": {"userEnteredFormat": header_style},
+        "fields": "userEnteredFormat(textFormat,backgroundColor,horizontalAlignment)"}})
+    reqs.append({"repeatCell": {
+        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": 2},
+        "cell": {"userEnteredFormat": {
+            "textFormat": {"bold": True},
+            "backgroundColor": {"red": 0.85, "green": 0.89, "blue": 0.96}}},
         "fields": "userEnteredFormat(textFormat,backgroundColor)"}})
     reqs.append({"updateSheetProperties": {
-        "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 1}},
+        "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 2}},
         "fields": "gridProperties.frozenRowCount"}})
     sheet.batch_update({"requests": reqs})
 
-    log.info(f"Wrote {len(df)} rows x {len(df.columns)} cols to '{title}'")
-
-
-def log_totals(df, label, cols):
-    parts = [f"{c}={df[c].sum():,.2f}" for c in cols if c in df.columns]
-    log.info(f"{label} totals: " + "  ".join(parts))
+    log.info(f"Wrote {len(df) - 1} data rows + Total row x {len(LABELS)} cols to '{WORKSHEET}'")
 
 
 # ========= MAIN ==========
@@ -341,33 +338,25 @@ def main():
         raise SystemExit(f"Missing env vars: {', '.join(missing)}")
 
     login()
-    date_from, date_to = date_range()
+    df = build_frame(fetch_stock())
 
-    store_df = build_df(fetch_fg_store(date_from, date_to), STORE_COLS)
-    detail_df = build_df(fetch_detail(), DETAIL_COLS)
-
-    log_totals(store_df, "FG Store",
-               ["Opening QTY", "Opening Value", "Received QTY", "Received Value",
-                "Delivery QTY", "Delivery Value", "Closing QTY", "Closing Value"])
-    log_totals(detail_df, "FG Store Details",
-               ["Order QTY", "Order Value", "Received QTY", "Received Value",
-                "Stock QTY", "Stock Value", "Pending QTY", "Pending Value"])
+    totals = df.iloc[0]
+    log.info("Totals: " + "  ".join(
+        f"{lbl}={totals[lbl]:,.2f}" for lbl, _, kind in COLUMNS if kind in ("qty", "value")))
 
     if os.getenv("FG_REPORT_DRY_RUN"):
-        store_df.to_csv("fg_store_dryrun.csv", index=False)
-        detail_df.to_csv("fg_store_details_dryrun.csv", index=False)
-        log.info("DRY RUN: wrote fg_store_dryrun.csv + fg_store_details_dryrun.csv, "
-                 "skipped Google Sheets")
+        out = os.getenv("FG_REPORT_DRY_RUN_PATH", "fg_stock_dryrun.csv")
+        df.to_csv(out, index=False)
+        log.info(f"DRY RUN: wrote {out} ({len(df) - 1} data rows), skipped Google Sheets")
         return
 
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_KEY)
-
-    push(sheet, STORE_WORKSHEET, store_df, STORE_COLS, STORE_TEXT, STORE_DATE)
-    push(sheet, DETAIL_WORKSHEET, detail_df, DETAIL_COLS, DETAIL_TEXT, DETAIL_DATE, DETAIL_INT)
-
-    log.info(f"Done at {datetime.now(DHAKA):%Y-%m-%d %H:%M} Asia/Dhaka "
-             f"(FG Store range {date_from} -> {date_to})")
+    # Write first, drop second: the tab we just wrote guarantees the spreadsheet
+    # still has a sheet left, so neither delete can hit the last-tab guard.
+    push(sheet, df)
+    drop_obsolete(sheet)
+    log.info(f"Done at {datetime.now(DHAKA):%Y-%m-%d %H:%M} Asia/Dhaka")
 
 
 if __name__ == "__main__":

@@ -5,13 +5,6 @@ on:
     # Hourly 02:00-12:00 UTC = 08:00-18:00 Asia/Dhaka (UTC+6), 11 runs a day.
     - cron: "0 2-12 * * *"
   workflow_dispatch:
-    inputs:
-      date_from:
-        description: "FG Store range start (YYYY-MM-DD). Blank = 1st of current month."
-        required: false
-      date_to:
-        description: "FG Store range end (YYYY-MM-DD). Blank = today (Asia/Dhaka)."
-        required: false
 
 concurrency:
   group: fg-report
@@ -44,6 +37,4 @@ jobs:
           ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
           ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
           GOOGLE_SHEET_CRED_JSON: ${{ secrets.GOOGLE_SHEET_CRED_JSON }}
-          FG_DATE_FROM: ${{ inputs.date_from }}
-          FG_DATE_TO: ${{ inputs.date_to }}
         run: python fg_report.py
