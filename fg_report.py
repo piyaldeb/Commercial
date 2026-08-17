@@ -13,8 +13,11 @@ Six tabs, laid out to match "Fg_Stock AS ON 15-08-2026 (1).xlsx":
   Partially ready LC RCV        |  the 2x2 split on LC Status x FG Status, each
   Full Goods Ready LC Pending   |  with a banner and a subtotal row, 19 columns.
   Partially ready LC Pending   /
-  SUMMERY                      Stock Value by LC/FG status against the DELIVERY
-                               DATE ageing buckets, with links to the four tabs.
+  SUMMERY                      TWO stacked pivots of Stock Value by LC/FG status,
+                               one per ageing scale: delivery-date ageing on top
+                               (rows 2-12, with a "Delivery not due" column) and
+                               FG in-house ageing below (rows 16-25). Both link
+                               out to the four category tabs.
 
 DERIVED COLUMNS. Reverse-engineered from the user's workbooks and verified to
 reproduce every row of both with zero mismatches:
@@ -32,7 +35,7 @@ reproduce every row of both with zero mismatches:
   Age        days since goods-in (the endpoint's days_passed), bucketed by Ageing.
   Age DD     days since the ED Date - negative when delivery is not yet due.
   Ageing DD  Age DD bucketed, with a "Delivery not due" band for negative values.
-             SUMMERY pivots on this, not on Ageing.
+             SUMMERY's first pivot uses this; its second uses Ageing.
 
 Both ageing scales use the same bands: <=5 / <=10 / <=20 / <=30 / <=60 / <=90 / >90.
 
@@ -185,13 +188,23 @@ AGEING_BUCKETS = [
 ]
 AGEING_ORDER = [label for _, label in AGEING_BUCKETS]
 NOT_DUE = "Delivery not due"
-# SUMMERY pivots on Ageing DD, so the not-due band is a column of its own.
-SUMMARY_COLUMNS = AGEING_ORDER + [NOT_DUE]
 # Parent LC Status followed by its FG Statuses, in the workbook's order.
 SUMMARY_GROUPS = [
     ("LC Received", "LC received", ["Full", "Partial"]),
     ("LC Pending",  "LC Pending",  ["Full OA", "Goods in Production"]),
 ]
+# SUMMERY carries TWO pivots of Stock Value, one per ageing scale. The delivery
+# one adds a "Delivery not due" band for orders not yet due; the goods-in one
+# has no such case, so its bucket list is the plain seven.
+#   title suffix, ageing column, bucket columns
+SUMMARY_TABLES = [
+    ("Ageing delivery date wise", "Ageing DD", AGEING_ORDER + [NOT_DUE]),
+    ("Ageing FG in house date wise", "Ageing", AGEING_ORDER),
+]
+# 1-indexed rows: table 1 title on 2, header on 5; table 2 title on 16, header
+# on 18 - matching the workbook.
+SUMMARY_TITLE_ROWS = [2, 16]
+SUMMARY_HEADER_ROWS = [5, 18]
 
 session = requests.Session()
 USER_ID = None
@@ -363,15 +376,13 @@ def build_category(master_df, lc_status, fg_status):
     return sel[CATEGORY_LABELS].reset_index(drop=True)
 
 
-def build_summary(master_df, tab_gids):
-    """Stock Value by LC Status / FG Status against the DELIVERY DATE ageing
-    buckets, mirroring the workbook's SUMMERY pivot."""
+def build_summary_table(master_df, tab_gids, ageing_col, buckets):
+    """Stock Value by LC Status / FG Status against one ageing scale."""
     body = master_df.iloc[1:]
     cat_by_fg = {fg: (title, banner, attn) for title, _, fg, banner, attn in CATEGORIES}
 
     def line(sel, label, particulars, attn="", tab=None):
-        cells = [round2(sel[sel["Ageing DD"] == c]["Stock Value"].sum())
-                 for c in SUMMARY_COLUMNS]
+        cells = [round2(sel[sel[ageing_col] == c]["Stock Value"].sum()) for c in buckets]
         link = ""
         if tab and tab in tab_gids:
             link = f'=HYPERLINK("#gid={tab_gids[tab]}","{tab}")'
@@ -386,9 +397,14 @@ def build_summary(master_df, tab_gids):
             rows.append(line(body[body["FG Status"] == fg], fg, banner, attn, title))
     rows.append(line(body, "Grand Total", "Grand Total"))
 
-    header = (["Particulars", "Row Labels"] + SUMMARY_COLUMNS
+    header = (["Particulars", "Row Labels"] + buckets
               + ["Grand Total", "Kindly attention", "sheet link"])
     return pd.DataFrame(rows, columns=header)
+
+
+def build_summaries(master_df, tab_gids):
+    return [build_summary_table(master_df, tab_gids, col, buckets)
+            for _, col, buckets in SUMMARY_TABLES]
 
 
 SUMMARY_KINDS = {"Particulars": "text", "Row Labels": "text",
@@ -443,19 +459,25 @@ def get_worksheet(sheet, title, rows, cols):
         return sheets_call(sheet.add_worksheet, title=title, rows=rows, cols=cols)
 
 
-def push(sheet, title, df, kinds, header_row=1, pre_cells=None,
+def push(sheet, title, frames, kinds, header_row=1, pre_cells=None,
          bold_rows=(), freeze=None):
     """Write one tab.
 
-    header_row  1-indexed row the column headers land on; data follows.
-    pre_cells   [(a1_range, values_2d)] written above the frame.
-    bold_rows   1-indexed rows to bold and shade (e.g. a Total or subtotal row).
+    frames      a DataFrame, or [(header_row, df), ...] to stack several tables
+                on one sheet (SUMMERY carries two pivots).
+    header_row  1-indexed row the headers land on when `frames` is a bare frame.
+    pre_cells   [(a1_range, values_2d)] written above/between the frames.
+    bold_rows   1-indexed rows to bold and shade (a Total or subtotal row).
     """
-    ws = get_worksheet(sheet, title, max(1000, len(df) + header_row + 50),
-                       max(40, len(df.columns) + 2))
+    if isinstance(frames, pd.DataFrame):
+        frames = [(header_row, frames)]
+    last_row = max(hr + len(df) for hr, df in frames)
+    width = max(len(df.columns) for _, df in frames)
 
-    need_rows = max(len(df) + header_row + 50, 200)
-    need_cols = max(len(df.columns) + 2, 40)
+    ws = get_worksheet(sheet, title, max(1000, last_row + 50), max(40, width + 2))
+
+    need_rows = max(last_row + 50, 200)
+    need_cols = max(width + 2, 40)
     if ws.row_count < need_rows or ws.col_count < need_cols:
         sheets_call(ws.resize, rows=max(ws.row_count, need_rows),
                     cols=max(ws.col_count, need_cols))
@@ -478,24 +500,34 @@ def push(sheet, title, df, kinds, header_row=1, pre_cells=None,
     # Text format must land BEFORE the values: USER_ENTERED honours an existing
     # TEXT format, and that is what keeps the leading zeros on LC numbers. The
     # 'formula' kind is skipped so HYPERLINK() is not stored as literal text.
-    text_reqs = [fmt(i, {"type": "TEXT"})
-                 for i, c in enumerate(df.columns) if kinds.get(c) == "text"]
+    # A column is TEXT only if no frame uses it numerically.
+    def col_kind(i):
+        seen = [kinds.get(df.columns[i]) for _, df in frames if i < len(df.columns)]
+        for k in seen:
+            if k in NUMBER_PATTERNS:
+                return k
+        return seen[0] if seen else None
+
+    text_reqs = [fmt(i, {"type": "TEXT"}) for i in range(width) if col_kind(i) == "text"]
     if text_reqs:
         sheets_call(sheet.batch_update, {"requests": text_reqs})
 
     for a1, values in (pre_cells or []):
         sheets_call(ws.update, values, a1, value_input_option="USER_ENTERED")
 
-    sheets_call(set_with_dataframe, ws, df, row=header_row, resize=False)
+    for hr, df in frames:
+        sheets_call(set_with_dataframe, ws, df, row=hr, resize=False)
 
-    reqs = [fmt(i, NUMBER_PATTERNS[kinds[c]])
-            for i, c in enumerate(df.columns) if kinds.get(c) in NUMBER_PATTERNS]
-    reqs.append({"repeatCell": {
-        "range": {"sheetId": sid, "startRowIndex": header_row - 1, "endRowIndex": header_row},
-        "cell": {"userEnteredFormat": {
-            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
-            "backgroundColor": BLUE, "horizontalAlignment": "CENTER"}},
-        "fields": "userEnteredFormat(textFormat,backgroundColor,horizontalAlignment)"}})
+    reqs = [fmt(i, NUMBER_PATTERNS[col_kind(i)])
+            for i in range(width) if col_kind(i) in NUMBER_PATTERNS]
+    for hr, _ in frames:
+        reqs.append({"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": hr - 1, "endRowIndex": hr},
+            "cell": {"userEnteredFormat": {
+                "textFormat": {"bold": True,
+                               "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
+                "backgroundColor": BLUE, "horizontalAlignment": "CENTER"}},
+            "fields": "userEnteredFormat(textFormat,backgroundColor,horizontalAlignment)"}})
     for r in bold_rows:
         reqs.append({"repeatCell": {
             "range": {"sheetId": sid, "startRowIndex": r - 1, "endRowIndex": r},
@@ -508,7 +540,8 @@ def push(sheet, title, df, kinds, header_row=1, pre_cells=None,
         "fields": "gridProperties.frozenRowCount"}})
     sheets_call(sheet.batch_update, {"requests": reqs})
 
-    log.info(f"  '{title}': {len(df)} rows x {len(df.columns)} cols")
+    shape = " + ".join(f"{len(df)}x{len(df.columns)}" for _, df in frames)
+    log.info(f"  '{title}': {shape}")
     return ws
 
 
@@ -523,13 +556,28 @@ def push_category(sheet, title, df, banner):
                 bold_rows=(1, 2), freeze=3)
 
 
-def push_summary(sheet, df, as_of):
-    title = (f" Finish Goods status as on {as_of.day} {as_of:%B %Y} "
-             f"( Ageing delivery date wise)")
-    kinds = {c: SUMMARY_KINDS.get(c, "value") for c in df.columns}
-    return push(sheet, SUMMARY_WORKSHEET, df, kinds, header_row=5,
-                pre_cells=[("A2", [[title]]), ("B4", [["Sum of Stock Value", "Column Labels"]])],
-                bold_rows=(2, 6, 9, 12), freeze=5)
+def push_summary(sheet, dfs, as_of):
+    """Both pivots stacked on one tab: delivery-date ageing on top, goods-in
+    ageing below, each with its own title and 'Sum of Stock Value' caption."""
+    kinds = {}
+    for df in dfs:
+        kinds.update({c: SUMMARY_KINDS.get(c, "value") for c in df.columns})
+
+    frames, pre_cells, bold = [], [], []
+    for df, (suffix, _, _), title_row, header_row in zip(
+            dfs, SUMMARY_TABLES, SUMMARY_TITLE_ROWS, SUMMARY_HEADER_ROWS):
+        frames.append((header_row, df))
+        pre_cells.append((f"A{title_row}",
+                          [[f" Finish Goods status as on {as_of.day} {as_of:%B %Y} "
+                            f"( {suffix})"]]))
+        pre_cells.append((f"B{header_row - 1}",
+                          [["Sum of Stock Value", "Column Labels"]]))
+        bold.append(title_row)
+        # the two LC parent rows and the Grand Total, relative to each header
+        bold += [header_row + 1, header_row + 4, header_row + 7]
+
+    return push(sheet, SUMMARY_WORKSHEET, frames, kinds,
+                pre_cells=pre_cells, bold_rows=tuple(bold), freeze=0)
 
 
 def drop_obsolete(sheet):
@@ -563,7 +611,9 @@ def main():
     log.info("Split: " + "  ".join(f"{t}={len(d)}" for t, _, d in categories)
              + f"  (sum={sum(len(d) for _, _, d in categories)} of {len(body)})")
     log.info("Ageing DD: " + "  ".join(
-        f"{c}={(body['Ageing DD'] == c).sum()}" for c in SUMMARY_COLUMNS))
+        f"{c}={(body['Ageing DD'] == c).sum()}" for c in AGEING_ORDER + [NOT_DUE]))
+    log.info("Ageing:    " + "  ".join(
+        f"{c}={(body['Ageing'] == c).sum()}" for c in AGEING_ORDER))
 
     covered = sum(len(d) for _, _, d in categories)
     if covered != len(body):
@@ -577,8 +627,9 @@ def main():
         master.to_csv(out, index=False)
         for title, _, d in categories:
             d.to_csv(out.replace(".csv", f" - {title}.csv"), index=False)
-        build_summary(master, {}).to_csv(out.replace(".csv", " - SUMMERY.csv"), index=False)
-        log.info(f"DRY RUN: wrote {out} and 5 companions, skipped Google Sheets")
+        for (suffix, _, _), s in zip(SUMMARY_TABLES, build_summaries(master, {})):
+            s.to_csv(out.replace(".csv", f" - SUMMERY ({suffix}).csv"), index=False)
+        log.info(f"DRY RUN: wrote {out} and 6 companions, skipped Google Sheets")
         return
 
     client = get_gspread_client()
@@ -589,7 +640,7 @@ def main():
     tab_gids = {}
     for title, banner, d in categories:
         tab_gids[title] = push_category(sheet, title, d, banner).id
-    push_summary(sheet, build_summary(master, tab_gids), as_of)
+    push_summary(sheet, build_summaries(master, tab_gids), as_of)
     # Drop last: the tabs just written guarantee the spreadsheet still has a
     # sheet left, so no delete can hit the last-tab guard.
     drop_obsolete(sheet)
