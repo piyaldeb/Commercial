@@ -47,6 +47,17 @@ operation.details and manufacturing.order carry no salesperson, so Sales Person
 (and Sales Team / Region where blank) is filled in from the linked sale.order via
 oa_id.
 
+TABS WRITTEN
+
+  Raw        the table above, rewritten in full on every run.
+  Lists      dropdown sources for the dashboard, all formulas over Raw.
+  Dashboard  the six metrics down, the days of the selected month across, driven
+             by dropdowns for Month / Company / Sales Team / Sales Person /
+             Customer / Measure. Every cell is a SUMIFS over Raw, so a selection
+             recalculates in the browser without re-running this script. Built
+             once and then left alone so the hourly Raw refresh never resets
+             someone's selections; RAW_REBUILD_DASHBOARD=1 rewrites it.
+
 Target sheet: https://docs.google.com/spreadsheets/d/1PI5KF_WpOIEb3zzqXuC2JNX4ntk6Pf5WkBg28eEM_kk
 """
 
@@ -85,6 +96,8 @@ PASSWORD = os.getenv("ODOO_PASSWORD")
 
 SHEET_KEY = "1PI5KF_WpOIEb3zzqXuC2JNX4ntk6Pf5WkBg28eEM_kk"
 WORKSHEET = "Raw"
+DASHBOARD_WORKSHEET = "Dashboard"
+LISTS_WORKSHEET = "Lists"
 
 COMPANY_IDS = [1, 3]
 COMPANY_NAMES = {1: "Zipper", 3: "Metal Trims"}
@@ -576,6 +589,8 @@ NUMBER_PATTERNS = {"date": {"type": "DATE", "pattern": "yyyy-mm-dd"},
                    "value": {"type": "NUMBER", "pattern": "#,##0.00"}}
 
 BLUE = {"red": 0.10, "green": 0.31, "blue": 0.58}
+PALE = {"red": 0.85, "green": 0.89, "blue": 0.96}
+PALE_YELLOW = {"red": 1.0, "green": 0.95, "blue": 0.80}
 
 
 def col_range(sheet_id, index, rows):
@@ -637,6 +652,259 @@ def push(sheet, df):
     log.info(f"Wrote {len(df)} rows to '{WORKSHEET}'")
 
 
+
+# ========= DASHBOARD ==========
+# A formula-driven dashboard rather than a pivot table: the selectors are plain
+# data-validation dropdowns and every cell is a SUMIFS over "Raw", so changing a
+# selection recalculates in the browser - no re-run of this script needed. It is
+# built ONCE and then left alone, so the hourly Raw refresh never clobbers the
+# selections someone left sitting in it. RAW_REBUILD_DASHBOARD=1 rewrites it.
+#
+# Raw column letters the formulas depend on:
+#   A Metric   B Date   C Month   D Company   E Sales Team
+#   F Sales Person      G Region  H Customer  P QTY   Q Value
+#
+# Selector cells on Dashboard:
+#   B3 Month   B4 Company   B5 Sales Team   B6 Sales Person   B7 Customer
+#   B8 Measure (QTY / Value)
+#
+# The Sales Person and Customer lists are DEPENDENT - they narrow to whichever
+# Sales Team is selected, so picking JAMUNA leaves only JAMUNA's people and
+# customers in the next two dropdowns. Validation is deliberately non-strict:
+# changing the team can leave a stale name behind in B6/B7, and a warning
+# triangle is friendlier than a hard rejection.
+#
+# "All" is the "*" SUMIFS wildcard, which matches any non-empty text. Safe here
+# because Company / Sales Team / Sales Person / Customer are never blank on any
+# row - checked across all six metrics.
+
+FIRST_DAY_COL = 2                      # B
+LAST_DAY_COL = FIRST_DAY_COL + 30      # AF, 31 days
+TOTAL_COL = LAST_DAY_COL + 1           # AG
+HEADER_ROW = 10
+FIRST_METRIC_ROW = HEADER_ROW + 1
+
+# selector row, label, dropdown source range, default
+SELECTORS = [
+    (3, "Month",        "Lists!$G$1:$G$40",  None),
+    (4, "Company",      "Lists!$I$1:$I$20",  "All"),
+    (5, "Sales Team",   "Lists!$A$1:$A$60",  "All"),
+    (6, "Sales Person", "Lists!$C$1:$C$120", "All"),
+    (7, "Customer",     "Lists!$E$1:$E$800", "All"),
+]
+
+
+def a1_col(index):
+    """1-based column number -> column letters."""
+    letters = ""
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def lists_formulas():
+    """Dropdown sources. Sales Person and Customer narrow to the selected team."""
+    team = "Dashboard!$B$5"
+    person = "Dashboard!$B$6"
+    return [
+        ("A1", "All"),
+        ("A2", '=IFERROR(SORT(UNIQUE(FILTER(Raw!$E$2:$E,Raw!$E$2:$E<>""))),"")'),
+        ("C1", "All"),
+        ("C2", '=IFERROR(SORT(UNIQUE(FILTER(Raw!$F$2:$F,Raw!$F$2:$F<>"",'
+               'IF(' + team + '="All",Raw!$F$2:$F<>"",Raw!$E$2:$E=' + team + ')))),"")'),
+        ("E1", "All"),
+        ("E2", '=IFERROR(SORT(UNIQUE(FILTER(Raw!$H$2:$H,Raw!$H$2:$H<>"",'
+               'IF(' + team + '="All",Raw!$H$2:$H<>"",Raw!$E$2:$E=' + team + '),'
+               'IF(' + person + '="All",Raw!$H$2:$H<>"",Raw!$F$2:$F=' + person + ')))),"")'),
+        ("G1", '=IFERROR(SORT(UNIQUE(FILTER(Raw!$C$2:$C,Raw!$C$2:$C<>""))),"")'),
+        ("I1", "All"),
+        ("I2", '=IFERROR(SORT(UNIQUE(FILTER(Raw!$D$2:$D,Raw!$D$2:$D<>""))),"")'),
+        # Which Raw column the Measure dropdown points at, for the SUMIFS below.
+        ("K1", '=IF(Dashboard!$B$8="QTY","P","Q")'),
+    ]
+
+
+def dashboard_formulas(default_month):
+    cells = [("A1", "Commercial Pipeline Dashboard")]
+    for row, label, _, default in SELECTORS:
+        cells.append(("A" + str(row), label))
+        if default is not None:
+            cells.append(("B" + str(row), default))
+    cells += [("B3", default_month), ("A8", "Measure"), ("B8", "Value")]
+
+    # Day header: the 1st of the selected month, then +1 for as long as the
+    # result is still inside that month, so short months leave blanks.
+    month_start = 'DATEVALUE($B$3&"-01")'
+    first = a1_col(FIRST_DAY_COL) + str(HEADER_ROW)
+    cells.append((first, '=IF($B$3="","",' + month_start + ')'))
+    for col in range(FIRST_DAY_COL + 1, LAST_DAY_COL + 1):
+        prev = a1_col(col - 1) + str(HEADER_ROW)
+        cells.append((a1_col(col) + str(HEADER_ROW),
+                      '=IF(OR($B$3="",' + prev + '=""),"",'
+                      'IF(MONTH(' + prev + '+1)=MONTH(' + month_start + '),'
+                      + prev + '+1,""))'))
+    cells.append(("A" + str(HEADER_ROW), "Details"))
+    cells.append((a1_col(TOTAL_COL) + str(HEADER_ROW), "Total"))
+
+    measure = 'INDIRECT("Raw!$"&Lists!$K$1&"$2:$"&Lists!$K$1)'
+    criteria = [("$D$2:$D", "$B$4"), ("$E$2:$E", "$B$5"),
+                ("$F$2:$F", "$B$6"), ("$H$2:$H", "$B$7")]
+    for offset, metric in enumerate(METRIC_ORDER):
+        row = FIRST_METRIC_ROW + offset
+        cells.append(("A" + str(row), metric))
+        for col in range(FIRST_DAY_COL, LAST_DAY_COL + 1):
+            head = a1_col(col) + "$" + str(HEADER_ROW)
+            parts = [measure, "Raw!$A$2:$A,$A" + str(row), "Raw!$B$2:$B," + head]
+            parts += ['Raw!' + rng + ',IF(' + sel + '="All","*",' + sel + ')'
+                      for rng, sel in criteria]
+            cells.append((a1_col(col) + str(row),
+                          '=IF(' + head + '="","",SUMIFS(' + ",".join(parts) + '))'))
+        cells.append((a1_col(TOTAL_COL) + str(row),
+                      '=IF($B$3="","",SUM(' + a1_col(FIRST_DAY_COL) + str(row)
+                      + ':' + a1_col(LAST_DAY_COL) + str(row) + '))'))
+
+    note_row = FIRST_METRIC_ROW + len(METRIC_ORDER) + 1
+    cells.append(("A" + str(note_row),
+                  "FG Store Balance and Production Pending are balances as of the "
+                  "last refresh, not daily flows - they show against today's date "
+                  "only. The other four are what happened on each day."))
+    return cells
+
+
+def ensure_dashboard(sheet, default_month):
+    existing = {ws.title for ws in sheets_call(sheet.worksheets)}
+    rebuild = bool(os.getenv("RAW_REBUILD_DASHBOARD"))
+    if DASHBOARD_WORKSHEET in existing and not rebuild:
+        log.info(f"'{DASHBOARD_WORKSHEET}' already exists, leaving it alone "
+                 f"(RAW_REBUILD_DASHBOARD=1 to rewrite)")
+        return
+
+    # Both tabs have to exist before either is written: the Lists formulas
+    # reference Dashboard! and the Dashboard formulas reference Lists!, and a
+    # formula naming a sheet that does not exist yet sticks as #REF! rather than
+    # resolving once the sheet appears.
+    if LISTS_WORKSHEET in existing:
+        lists_ws = sheet.worksheet(LISTS_WORKSHEET)
+    else:
+        lists_ws = sheets_call(sheet.add_worksheet, title=LISTS_WORKSHEET,
+                               rows=1000, cols=12)
+    if DASHBOARD_WORKSHEET in existing:
+        ws = sheet.worksheet(DASHBOARD_WORKSHEET)
+    else:
+        ws = sheets_call(sheet.add_worksheet, title=DASHBOARD_WORKSHEET,
+                         rows=40, cols=TOTAL_COL + 2)
+    if ws.row_count < 40 or ws.col_count < TOTAL_COL + 2:
+        sheets_call(ws.resize, rows=max(ws.row_count, 40),
+                    cols=max(ws.col_count, TOTAL_COL + 2))
+
+    sheets_call(lists_ws.clear)
+    sheets_call(ws.clear)
+    sheets_call(lists_ws.batch_update,
+                [{"range": ref, "values": [[val]]} for ref, val in lists_formulas()],
+                value_input_option="USER_ENTERED")
+    sheets_call(ws.batch_update,
+                [{"range": ref, "values": [[val]]}
+                 for ref, val in dashboard_formulas(default_month)],
+                value_input_option="USER_ENTERED")
+
+    sid = ws.id
+    last_metric_row = FIRST_METRIC_ROW + len(METRIC_ORDER)
+    reqs = []
+    for row, _, source, _ in SELECTORS:
+        reqs.append({"setDataValidation": {
+            "range": {"sheetId": sid, "startRowIndex": row - 1, "endRowIndex": row,
+                      "startColumnIndex": 1, "endColumnIndex": 2},
+            "rule": {"condition": {"type": "ONE_OF_RANGE",
+                                   "values": [{"userEnteredValue": "=" + source}]},
+                     "showCustomUi": True, "strict": False}}})
+    reqs.append({"setDataValidation": {
+        "range": {"sheetId": sid, "startRowIndex": 7, "endRowIndex": 8,
+                  "startColumnIndex": 1, "endColumnIndex": 2},
+        "rule": {"condition": {"type": "ONE_OF_LIST",
+                               "values": [{"userEnteredValue": "QTY"},
+                                          {"userEnteredValue": "Value"}]},
+                 "showCustomUi": True, "strict": True}}})
+    reqs += [
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": 4},
+            "cell": {"userEnteredFormat": {
+                "textFormat": {"bold": True, "fontSize": 14}}},
+            "fields": "userEnteredFormat.textFormat"}},
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": 2, "endRowIndex": 8,
+                      "startColumnIndex": 0, "endColumnIndex": 1},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat"}},
+        # Shade the selector cells, so it is obvious what you are meant to click.
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": 2, "endRowIndex": 8,
+                      "startColumnIndex": 1, "endColumnIndex": 2},
+            "cell": {"userEnteredFormat": {"backgroundColor": PALE_YELLOW}},
+            "fields": "userEnteredFormat.backgroundColor"}},
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": HEADER_ROW - 1,
+                      "endRowIndex": HEADER_ROW, "startColumnIndex": 0,
+                      "endColumnIndex": TOTAL_COL},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": BLUE,
+                "horizontalAlignment": "CENTER",
+                "numberFormat": {"type": "DATE", "pattern": "d-mmm"},
+                "textFormat": {"bold": True, "foregroundColor": {
+                    "red": 1, "green": 1, "blue": 1}}}},
+            "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                      "numberFormat,textFormat)"}},
+        # "Details" and "Total" are labels, not dates - undo the date format.
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": HEADER_ROW - 1,
+                      "endRowIndex": HEADER_ROW, "startColumnIndex": 0,
+                      "endColumnIndex": 1},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}},
+            "fields": "userEnteredFormat.numberFormat"}},
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": HEADER_ROW - 1,
+                      "endRowIndex": HEADER_ROW,
+                      "startColumnIndex": TOTAL_COL - 1, "endColumnIndex": TOTAL_COL},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}},
+            "fields": "userEnteredFormat.numberFormat"}},
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": HEADER_ROW,
+                      "endRowIndex": last_metric_row, "startColumnIndex": 0,
+                      "endColumnIndex": 1},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat"}},
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": HEADER_ROW,
+                      "endRowIndex": last_metric_row, "startColumnIndex": 1,
+                      "endColumnIndex": TOTAL_COL},
+            "cell": {"userEnteredFormat": {
+                "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}},
+            "fields": "userEnteredFormat.numberFormat"}},
+        {"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": HEADER_ROW,
+                      "endRowIndex": last_metric_row,
+                      "startColumnIndex": TOTAL_COL - 1, "endColumnIndex": TOTAL_COL},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
+                                           "backgroundColor": PALE}},
+            "fields": "userEnteredFormat(textFormat,backgroundColor)"}},
+        {"updateSheetProperties": {
+            "properties": {"sheetId": sid, "gridProperties": {
+                "frozenRowCount": HEADER_ROW, "frozenColumnCount": 1}},
+            "fields": "gridProperties(frozenRowCount,frozenColumnCount)"}},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "COLUMNS",
+                      "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 165}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "COLUMNS",
+                      "startIndex": 1, "endIndex": TOTAL_COL},
+            "properties": {"pixelSize": 78}, "fields": "pixelSize"}},
+    ]
+    sheets_call(sheet.batch_update, {"requests": reqs})
+    log.info(f"Built '{DASHBOARD_WORKSHEET}' and '{LISTS_WORKSHEET}'")
+
+
 # ========= MAIN ==========
 def main():
     as_of = datetime.now(DHAKA).date()
@@ -653,6 +921,7 @@ def main():
     client = get_gspread_client()
     sheet = sheets_call(client.open_by_key, SHEET_KEY)
     push(sheet, df)
+    ensure_dashboard(sheet, as_of.strftime("%Y-%m"))
     log.info("Done")
 
 
