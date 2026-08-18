@@ -38,3 +38,15 @@ jobs:
           ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
           GOOGLE_SHEET_CRED_JSON: ${{ secrets.GOOGLE_SHEET_CRED_JSON }}
         run: python fg_report.py
+
+      # Writes the "Raw" tab of a different spreadsheet, so it does not depend on
+      # fg_report.py having succeeded.
+      - name: Run pi_dispatch_raw.py
+        if: always()
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
+          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
+          GOOGLE_SHEET_CRED_JSON: ${{ secrets.GOOGLE_SHEET_CRED_JSON }}
+        run: python pi_dispatch_raw.py
