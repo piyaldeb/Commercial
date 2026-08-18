@@ -1,0 +1,40 @@
+name: PI/Dispatch Raw (hourly)
+
+on:
+  schedule:
+    # Hourly 02:00-12:00 UTC = 08:00-18:00 Asia/Dhaka (UTC+6), 11 runs a day.
+    - cron: "0 2-12 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pi-dispatch-raw
+  cancel-in-progress: false
+
+jobs:
+  pi-dispatch-raw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pi_dispatch_raw.py
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
+          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
+          GOOGLE_SHEET_CRED_JSON: ${{ secrets.GOOGLE_SHEET_CRED_JSON }}
+        run: python pi_dispatch_raw.py
