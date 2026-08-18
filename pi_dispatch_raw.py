@@ -111,8 +111,9 @@ COLUMNS = [
     ("Region",       "text"),
     ("Customer",     "text"),
     ("Buyer",        "text"),
-    ("Doc No",       "id"),
-    ("OA",           "id"),
+    ("PI No",        "id"),
+    ("OA No",        "id"),
+    ("Invoice No",   "id"),
     ("LC No",        "id"),
     ("Item",         "text"),
     ("Doc Date",     "date"),
@@ -322,6 +323,22 @@ def fetch_running_orders():
     return [r for r in recs if m2o_id(r.get("company_id")) in COMPANY_IDS]
 
 
+def fetch_released_oas(pi_ids):
+    """A PI carries no pointer to its OA - the link is the OA's order_ref, so it
+    has to be walked backwards. A PI can be released in several goes (19 of this
+    month's 391, up to 8 OAs on one), hence a list per PI."""
+    pi_ids = sorted({i for i in pi_ids if i})
+    by_pi = {}
+    for i in range(0, len(pi_ids), 500):
+        chunk = pi_ids[i:i + 500]
+        for rec in call_kw("sale.order", "search_read",
+                           [[["sales_type", "=", "oa"], ["order_ref", "in", chunk]],
+                            ["name", "order_ref"]], limit=0) or []:
+            by_pi.setdefault(m2o_id(rec["order_ref"]), []).append(clean_text(rec["name"]))
+    log.info(f"  released OAs: {sum(len(v) for v in by_pi.values())} for {len(by_pi)} PIs")
+    return by_pi
+
+
 def fetch_oa_lookup(oa_ids):
     """operation.details and manufacturing.order carry no salesperson; their
     oa_id points at sale.order, which does."""
@@ -331,7 +348,8 @@ def fetch_oa_lookup(oa_ids):
         chunk = oa_ids[i:i + 500]
         for rec in call_kw("sale.order", "read",
                            [chunk, ["name", "user_id", "team_id", "region_id",
-                                    "partner_id", "buyer_name", "lc_number"]]) or []:
+                                    "partner_id", "buyer_name", "lc_number",
+                                    "order_ref"]]) or []:
             lookup[rec["id"]] = rec
     log.info(f"  sale.order lookup: {len(lookup)} OAs")
     return lookup
@@ -349,7 +367,7 @@ def stamp(row, metric, day):
     return row
 
 
-def rows_sale_orders(recs, metric):
+def rows_sale_orders(recs, metric, released_oas=None):
     out = []
     for r in recs:
         row = blank_row()
@@ -360,8 +378,14 @@ def rows_sale_orders(recs, metric):
         row["Region"] = m2o_name(r.get("region_id"))
         row["Customer"] = m2o_name(r.get("partner_id"))
         row["Buyer"] = m2o_name(r.get("buyer_name"))
-        row["Doc No"] = clean_text(r.get("name"))
-        row["OA"] = clean_text(r.get("name")) if metric == M_OA else m2o_name(r.get("order_ref"))
+        if metric == M_OA:
+            # An OA points back at the PI it was released from.
+            row["PI No"] = m2o_name(r.get("order_ref"))
+            row["OA No"] = clean_text(r.get("name"))
+        else:
+            # A PI may have been released as several OAs, or none yet.
+            row["PI No"] = clean_text(r.get("name"))
+            row["OA No"] = ", ".join((released_oas or {}).get(r["id"], []))
         row["LC No"] = clean_text(r.get("lc_number"))
         row["Doc Date"] = clean_date(r.get("date_order"))
         row["QTY"] = round2(r.get("total_product_qty"))
@@ -384,8 +408,9 @@ def rows_invoice_lines(recs, headers, oa_lookup):
         row["Customer"] = m2o_name(r.get("customer_id"))
         row["Buyer"] = m2o_name(r.get("buyer_id"))
         row["Region"] = m2o_name(oa.get("region_id"))
-        row["Doc No"] = clean_text(head.get("name")) or m2o_name(r.get("invoice_id"))
-        row["OA"] = m2o_name(r.get("sale_order"))
+        row["PI No"] = m2o_name(r.get("pi_number")) or m2o_name(oa.get("order_ref"))
+        row["OA No"] = m2o_name(r.get("sale_order"))
+        row["Invoice No"] = clean_text(head.get("name")) or m2o_name(r.get("invoice_id"))
         row["LC No"] = clean_text(head.get("lc_no"))
         row["Item"] = clean_text(r.get("fg_categ_type"))
         row["Doc Date"] = clean_date(r.get("invoice_date"))
@@ -408,8 +433,9 @@ def rows_deliveries(recs, oa_lookup):
         row["Region"] = m2o_name(oa.get("region_id"))
         row["Customer"] = m2o_name(r.get("partner_id"))
         row["Buyer"] = m2o_name(r.get("buyer_id"))
-        row["Doc No"] = clean_text(r.get("delivery_code"))
-        row["OA"] = m2o_name(r.get("oa_id"))
+        row["PI No"] = m2o_name(oa.get("order_ref"))
+        row["OA No"] = m2o_name(r.get("oa_id"))
+        row["Invoice No"] = clean_text(r.get("delivery_code"))
         row["LC No"] = clean_text(oa.get("lc_number"))
         row["Item"] = clean_text(r.get("fg_categ_type"))
         row["Doc Date"] = clean_date(r.get("date_order"))
@@ -432,8 +458,9 @@ def rows_fg_store(recs, as_of):
         row["Region"] = clean_text(r.get("region_name"))
         row["Customer"] = clean_text(r.get("customer_name"))
         row["Buyer"] = clean_text(r.get("buyer_name"))
-        row["Doc No"] = clean_text(r.get("invoice_number"))
-        row["OA"] = clean_text(r.get("oa_name"))
+        row["PI No"] = clean_text(r.get("pi"))
+        row["OA No"] = clean_text(r.get("oa_name"))
+        row["Invoice No"] = clean_text(r.get("invoice_number"))
         row["LC No"] = clean_text(r.get("lc_number"))
         row["Item"] = clean_text(r.get("fg_categ_type"))
         row["Doc Date"] = clean_date(r.get("goods_in_date"))
@@ -456,7 +483,8 @@ def rows_running_orders(recs, oa_lookup, as_of):
         row["Region"] = m2o_name(oa.get("region_id"))
         row["Customer"] = m2o_name(r.get("partner_id"))
         row["Buyer"] = m2o_name(r.get("buyer_name"))
-        row["OA"] = m2o_name(r.get("oa_id"))
+        row["PI No"] = m2o_name(oa.get("order_ref"))
+        row["OA No"] = m2o_name(r.get("oa_id"))
         row["LC No"] = clean_text(oa.get("lc_number"))
         row["Item"] = clean_text(r.get("fg_categ_type")) or m2o_name(r.get("product_template_id"))
         row["Doc Date"] = clean_date(r.get("date_order"))
@@ -492,7 +520,9 @@ def build(as_of):
                                 + [m2o_id(r.get("oa_id")) for r in running]
                                 + [m2o_id(r.get("sale_order")) for r in invoice_lines])
 
-    rows = (rows_sale_orders(pis, M_PI)
+    released_oas = fetch_released_oas([r["id"] for r in pis])
+
+    rows = (rows_sale_orders(pis, M_PI, released_oas)
             + rows_sale_orders(oas, M_OA)
             + rows_invoice_lines(invoice_lines, headers, oa_lookup)
             + rows_deliveries(deliveries, oa_lookup)
