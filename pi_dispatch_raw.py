@@ -26,6 +26,23 @@ oa_released / lc_received / packed / dispatched:
                      only the lines carry company_id and the salesperson.
                      Verified: row count, qty AND value match lc_received exactly
                      for both companies.
+  Production Done    manufacturing.order, closing_date in the month, state not
+                     'cancel'.  (running order.har)  The orders finished that
+                     day: QTY = done_qty, value = that * final_price.  This is
+                     the flow that draws Production Pending down.
+                     closing_date, not date_order: manufacturing orders inherit
+                     the OA's own date, so a "released to production" series is
+                     OA Released again to the unit on every day of the month.
+                     (date_order is also computed, so Odoo refuses to filter or
+                     group on it - only the stored date_order_ twin works.)
+  FG Packing         operation.details, next_operation='FG Packing',
+                     state not in (cancel, closed), action_date in the month.
+                     Value = qty * final_price.  The goods-INTO-FG-store flow,
+                     i.e. the summary's 'packed' stage - the same shape as
+                     Dispatch, which is the goods-out flow.
+                     Verified: 21 of the month's 28 day/company cells match
+                     packed to the cent; the other 7 sit within 0.09% of it, the
+                     summary being a cron-refreshed snapshot that lags live data.
   Dispatch           operation.details, next_operation='Delivery',
                      state not in (cancel, closed), action_date in the month.
                      (Fg Delivery.har)  Value = qty * final_price.
@@ -41,7 +58,12 @@ oa_released / lc_received / packed / dispatched:
 The last two are BALANCES, not monthly flows: they are what is outstanding right
 now, including stock and orders older than this month, so they are NOT filtered
 to the month. Each such row is stamped with the run date so it lands on today's
-column in a date pivot; its own document date is kept in "Doc Date".
+column in a date pivot; its own document date is kept in "Doc Date". Odoo keeps
+no history of either, so there is no honest way to spread them across the month -
+which is why FG Packing and Production Done exist: they are the dated events
+behind the same two stages, and they are what the day columns are for. On the dashboard
+the balance rows are blank on every day but the refresh day, so a row of 0.00
+never gets mistaken for missing data.
 
 operation.details and manufacturing.order carry no salesperson, so Sales Person
 (and Sales Team / Region where blank) is filled in from the linked sale.order via
@@ -100,7 +122,7 @@ DASHBOARD_WORKSHEET = "Dashboard"
 LISTS_WORKSHEET = "Lists"
 # Stamped into Lists!L1. Bump it whenever the layout or a formula changes and the
 # next run replaces the built dashboard instead of leaving the stale one alone.
-DASHBOARD_VERSION = "2"
+DASHBOARD_VERSION = "3"
 
 COMPANY_IDS = [1, 3]
 COMPANY_NAMES = {1: "Zipper", 3: "Metal Trims"}
@@ -110,10 +132,14 @@ DHAKA = timezone(timedelta(hours=6))
 M_PI = "PI issue"
 M_OA = "OA Released"
 M_LC = "LC Received"
+M_PRODUCTION = "Production Done"
+M_PACKING = "FG Packing"
 M_DISPATCH = "Dispatch"
 M_FG = "FG Store Balance"
 M_PROD = "Production Pending"
-METRIC_ORDER = [M_PI, M_OA, M_LC, M_DISPATCH, M_FG, M_PROD]
+METRIC_ORDER = [M_PI, M_OA, M_LC, M_PRODUCTION, M_PACKING, M_DISPATCH, M_FG, M_PROD]
+# Snapshots rather than daily flows - they carry one date, the run date.
+BALANCE_METRICS = {M_FG, M_PROD}
 
 # label, kind. "id" columns are written as text so LC / invoice numbers keep
 # their leading zeros (set_with_dataframe writes USER_ENTERED).
@@ -300,9 +326,11 @@ def fetch_invoice_headers(invoice_ids):
     return lookup
 
 
-def fetch_deliveries(start, end):
-    """Dispatch. Value is qty * final_price - final_price is the unit price."""
-    domain = [["next_operation", "=", "Delivery"],
+def fetch_operations(next_operation, start, end):
+    """FG Packing (into the store) and Delivery (out of it) are the same model,
+    the same shape and the same date field - only next_operation differs. Value
+    is qty * final_price; final_price is the unit price, price_unit is 0 here."""
+    domain = [["next_operation", "=", next_operation],
               ["state", "not in", ["cancel", "closed"]],
               ["company_id", "in", COMPANY_IDS],
               ["action_date", ">=", f"{start} 00:00:00"],
@@ -327,15 +355,27 @@ def fetch_fg_store():
     return rows
 
 
+MO_FIELDS = ["oa_id", "company_id", "partner_id", "buyer_name", "team_id",
+             "date_order", "closing_date", "fg_categ_type", "product_template_id",
+             "product_uom_qty", "done_qty", "balance_qty", "final_price", "state"]
+
+
+def fetch_production(start, end):
+    """Production Done - manufacturing orders closed off in the month, which is
+    production actually completed. done_qty equals the ordered qty on every one
+    of them, so nothing is lost by taking the closing day as the day."""
+    domain = [["state", "!=", "cancel"],
+              ["company_id", "in", COMPANY_IDS],
+              ["closing_date", ">=", f"{start} 00:00:00"],
+              ["closing_date", "<=", f"{end} 23:59:59"]]
+    return search_read("manufacturing.order", domain, MO_FIELDS)
+
+
 def fetch_running_orders():
     """Production Pending - the running-order list, balance still to produce."""
     domain = ["&", "&", ["oa_total_balance", ">", 0], ["oa_id", "!=", False],
               ["state", "not in", ["closed", "cancel", "hold"]]]
-    recs = search_read("manufacturing.order", domain,
-                       ["oa_id", "company_id", "partner_id", "buyer_name", "team_id",
-                        "date_order", "fg_categ_type", "product_template_id",
-                        "product_uom_qty", "done_qty", "balance_qty", "final_price",
-                        "state"])
+    recs = search_read("manufacturing.order", domain, MO_FIELDS)
     return [r for r in recs if m2o_id(r.get("company_id")) in COMPANY_IDS]
 
 
@@ -437,12 +477,12 @@ def rows_invoice_lines(recs, headers, oa_lookup):
     return out
 
 
-def rows_deliveries(recs, oa_lookup):
+def rows_operations(recs, metric, oa_lookup):
     out = []
     for r in recs:
         oa = oa_lookup.get(m2o_id(r.get("oa_id"))) or {}
         row = blank_row()
-        stamp(row, M_DISPATCH, r.get("action_date"))
+        stamp(row, metric, r.get("action_date"))
         row["Company"] = m2o_name(r.get("company_id"))
         row["Sales Team"] = m2o_name(r.get("team_id")) or m2o_name(oa.get("team_id"))
         row["Sales Person"] = m2o_name(oa.get("user_id"))
@@ -486,13 +526,15 @@ def rows_fg_store(recs, as_of):
     return out
 
 
-def rows_running_orders(recs, oa_lookup, as_of):
-    """Balance as of the run date - order quantity still to be produced."""
+def rows_manufacturing(recs, oa_lookup, metric, qty_field, day_field=None,
+                       as_of=None):
+    """Production Done is a flow, dated on the day the order closed; Production
+    Pending is the balance still to make, so it carries the run date instead."""
     out = []
     for r in recs:
         oa = oa_lookup.get(m2o_id(r.get("oa_id"))) or {}
         row = blank_row()
-        stamp(row, M_PROD, as_of)
+        stamp(row, metric, as_of or r.get(day_field))
         row["Company"] = m2o_name(r.get("company_id"))
         row["Sales Team"] = m2o_name(r.get("team_id")) or m2o_name(oa.get("team_id"))
         row["Sales Person"] = m2o_name(oa.get("user_id"))
@@ -504,8 +546,8 @@ def rows_running_orders(recs, oa_lookup, as_of):
         row["LC No"] = clean_text(oa.get("lc_number"))
         row["Item"] = clean_text(r.get("fg_categ_type")) or m2o_name(r.get("product_template_id"))
         row["Doc Date"] = clean_date(r.get("date_order"))
-        row["QTY"] = round2(r.get("balance_qty"))
-        row["Value"] = round2((r.get("balance_qty") or 0) * (r.get("final_price") or 0))
+        row["QTY"] = round2(r.get(qty_field))
+        row["Value"] = round2((r.get(qty_field) or 0) * (r.get("final_price") or 0))
         row["Status"] = clean_text(r.get("state"))
         out.append(row)
     return out
@@ -523,8 +565,14 @@ def build(as_of):
     invoice_lines = fetch_invoice_lines(start, end)
     headers = fetch_invoice_headers([m2o_id(r.get("invoice_id")) for r in invoice_lines])
 
+    log.info("Fetching Production Done ...")
+    production = fetch_production(start, end)
+
+    log.info("Fetching FG Packing ...")
+    packings = fetch_operations("FG Packing", start, end)
+
     log.info("Fetching Dispatch ...")
-    deliveries = fetch_deliveries(start, end)
+    deliveries = fetch_operations("Delivery", start, end)
 
     log.info("Fetching FG Store Balance ...")
     fg = fetch_fg_store()
@@ -532,7 +580,9 @@ def build(as_of):
     log.info("Fetching Production Pending ...")
     running = fetch_running_orders()
 
-    oa_lookup = fetch_oa_lookup([m2o_id(r.get("oa_id")) for r in deliveries]
+    oa_lookup = fetch_oa_lookup([m2o_id(r.get("oa_id")) for r in packings]
+                                + [m2o_id(r.get("oa_id")) for r in deliveries]
+                                + [m2o_id(r.get("oa_id")) for r in production]
                                 + [m2o_id(r.get("oa_id")) for r in running]
                                 + [m2o_id(r.get("sale_order")) for r in invoice_lines])
 
@@ -541,9 +591,12 @@ def build(as_of):
     rows = (rows_sale_orders(pis, M_PI, released_oas)
             + rows_sale_orders(oas, M_OA)
             + rows_invoice_lines(invoice_lines, headers, oa_lookup)
-            + rows_deliveries(deliveries, oa_lookup)
+            + rows_manufacturing(production, oa_lookup, M_PRODUCTION, "done_qty",
+                                 day_field="closing_date")
+            + rows_operations(packings, M_PACKING, oa_lookup)
+            + rows_operations(deliveries, M_DISPATCH, oa_lookup)
             + rows_fg_store(fg, as_of)
-            + rows_running_orders(running, oa_lookup, as_of))
+            + rows_manufacturing(running, oa_lookup, M_PROD, "balance_qty", as_of=as_of))
 
     df = pd.DataFrame(rows, columns=LABELS)
     order = {m: i for i, m in enumerate(METRIC_ORDER)}
@@ -767,17 +820,28 @@ def dashboard_formulas(default_month):
             parts = [measure, "Raw!$A$2:$A,$A" + str(row), "Raw!$B$2:$B," + head]
             parts += ['Raw!' + rng + ',IF(' + sel + '="All","*",' + sel + ')'
                       for rng, sel in criteria]
+            body = 'SUMIFS(' + ",".join(parts) + ')'
+            if metric in BALANCE_METRICS:
+                # A balance carries a single date - the last refresh - so every
+                # other day would read 0.00 and be taken for missing data. Blank
+                # them, and let MAXIFS find the refresh day so the formula keeps
+                # up with the hourly run on its own.
+                body = ('IF(' + head + '<>MAXIFS(Raw!$B$2:$B,Raw!$A$2:$A,$A'
+                        + str(row) + '),"",' + body + ')')
             cells.append((a1_col(col) + str(row),
-                          '=IF(' + head + '="","",SUMIFS(' + ",".join(parts) + '))'))
+                          '=IF(' + head + '="","",' + body + ')'))
         cells.append((a1_col(TOTAL_COL) + str(row),
                       '=IF($B$3="","",SUM(' + a1_col(FIRST_DAY_COL) + str(row)
                       + ':' + a1_col(LAST_DAY_COL) + str(row) + '))'))
 
     note_row = FIRST_METRIC_ROW + len(METRIC_ORDER) + 1
     cells.append(("A" + str(note_row),
-                  "FG Store Balance and Production Pending are balances as of the "
-                  "last refresh, not daily flows - they show against today's date "
-                  "only. The other four are what happened on each day."))
+                  "The first six rows are daily flows - what happened on each "
+                  "day. FG Store Balance and Production Pending are balances as "
+                  "of the last refresh, so they carry a number on the refresh day "
+                  "only and stay blank on every other day; for the day-by-day "
+                  "version of those two stages read FG Packing (into the store) "
+                  "and Production Done (orders finished in the factory)."))
     return cells
 
 
@@ -839,6 +903,8 @@ def ensure_dashboard(sheet, default_month):
 
     sid = ws.id
     last_metric_row = FIRST_METRIC_ROW + len(METRIC_ORDER)
+    balance_rows = [FIRST_METRIC_ROW + i for i, m in enumerate(METRIC_ORDER)
+                    if m in BALANCE_METRICS]
     reqs = []
     for row, _, source, _ in SELECTORS:
         reqs.append({"setDataValidation": {
@@ -910,6 +976,15 @@ def ensure_dashboard(sheet, default_month):
             "cell": {"userEnteredFormat": {
                 "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}},
             "fields": "userEnteredFormat.numberFormat"}},
+        # Italic on the balance rows: they are read differently from the flows
+        # above them, and a mostly-blank row wants a reason on the face of it.
+        {"repeatCell": {
+            "range": {"sheetId": sid,
+                      "startRowIndex": min(balance_rows) - 1,
+                      "endRowIndex": max(balance_rows),
+                      "startColumnIndex": 0, "endColumnIndex": TOTAL_COL},
+            "cell": {"userEnteredFormat": {"textFormat": {"italic": True}}},
+            "fields": "userEnteredFormat.textFormat.italic"}},
         {"repeatCell": {
             "range": {"sheetId": sid, "startRowIndex": HEADER_ROW,
                       "endRowIndex": last_metric_row,
