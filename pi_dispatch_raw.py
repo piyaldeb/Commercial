@@ -98,6 +98,9 @@ SHEET_KEY = "1PI5KF_WpOIEb3zzqXuC2JNX4ntk6Pf5WkBg28eEM_kk"
 WORKSHEET = "Raw"
 DASHBOARD_WORKSHEET = "Dashboard"
 LISTS_WORKSHEET = "Lists"
+# Stamped into Lists!L1. Bump it whenever the layout or a formula changes and the
+# next run replaces the built dashboard instead of leaving the stale one alone.
+DASHBOARD_VERSION = "2"
 
 COMPANY_IDS = [1, 3]
 COMPANY_NAMES = {1: "Zipper", 3: "Metal Trims"}
@@ -722,6 +725,7 @@ def lists_formulas():
         ("I2", '=IFERROR(SORT(UNIQUE(FILTER(Raw!$D$2:$D,Raw!$D$2:$D<>""))),"")'),
         # Which Raw column the Measure dropdown points at, for the SUMIFS below.
         ("K1", '=IF(Dashboard!$B$8="QTY","P","Q")'),
+        ("L1", DASHBOARD_VERSION),
     ]
 
 
@@ -735,14 +739,19 @@ def dashboard_formulas(default_month):
 
     # Day header: the 1st of the selected month, then +1 for as long as the
     # result is still inside that month, so short months leave blanks.
-    month_start = 'DATEVALUE($B$3&"-01")'
+    # B3 is meant to hold the text "2026-08", but Sheets parses that shape as a
+    # date on entry, so the cell can legitimately end up either. ISNUMBER tells
+    # them apart; EOMONTH(x,-1)+1 walks a date back to the 1st of its own month.
+    month_start = ('IF(ISNUMBER($B$3),EOMONTH($B$3,-1)+1,'
+                   'DATEVALUE($B$3&"-01"))')
     first = a1_col(FIRST_DAY_COL) + str(HEADER_ROW)
+    anchor = "$" + a1_col(FIRST_DAY_COL) + "$" + str(HEADER_ROW)
     cells.append((first, '=IF($B$3="","",' + month_start + ')'))
     for col in range(FIRST_DAY_COL + 1, LAST_DAY_COL + 1):
         prev = a1_col(col - 1) + str(HEADER_ROW)
         cells.append((a1_col(col) + str(HEADER_ROW),
                       '=IF(OR($B$3="",' + prev + '=""),"",'
-                      'IF(MONTH(' + prev + '+1)=MONTH(' + month_start + '),'
+                      'IF(MONTH(' + prev + '+1)=MONTH(' + anchor + '),'
                       + prev + '+1,""))'))
     cells.append(("A" + str(HEADER_ROW), "Details"))
     cells.append((a1_col(TOTAL_COL) + str(HEADER_ROW), "Total"))
@@ -776,9 +785,21 @@ def ensure_dashboard(sheet, default_month):
     existing = {ws.title for ws in sheets_call(sheet.worksheets)}
     rebuild = bool(os.getenv("RAW_REBUILD_DASHBOARD"))
     if DASHBOARD_WORKSHEET in existing and not rebuild:
-        log.info(f"'{DASHBOARD_WORKSHEET}' already exists, leaving it alone "
-                 f"(RAW_REBUILD_DASHBOARD=1 to rewrite)")
-        return
+        # Rebuilding every hour would wipe whatever the user had selected, so it
+        # only happens when the built layout is older than the code.
+        built = ""
+        if LISTS_WORKSHEET in existing:
+            try:
+                built = str(sheets_call(
+                    sheet.worksheet(LISTS_WORKSHEET).acell, "L1").value or "")
+            except Exception:
+                built = ""
+        if built.strip() == DASHBOARD_VERSION:
+            log.info(f"'{DASHBOARD_WORKSHEET}' is at v{DASHBOARD_VERSION}, "
+                     f"leaving it alone")
+            return
+        log.info(f"'{DASHBOARD_WORKSHEET}' is at v{built or '?'}, rebuilding at "
+                 f"v{DASHBOARD_VERSION} (dropdown selections reset)")
 
     # Both tabs have to exist before either is written: the Lists formulas
     # reference Dashboard! and the Dashboard formulas reference Lists!, and a
@@ -803,6 +824,14 @@ def ensure_dashboard(sheet, default_month):
     sheets_call(lists_ws.batch_update,
                 [{"range": ref, "values": [[val]]} for ref, val in lists_formulas()],
                 value_input_option="USER_ENTERED")
+    # TEXT on B3 before the write, or USER_ENTERED turns "2026-08" into the date
+    # serial for 1 Aug. It still *displays* as 2026-08, so the damage is invisible
+    # until $B$3&"-01" builds "46235-01" and the whole grid goes #VALUE!.
+    sheets_call(sheet.batch_update, {"requests": [{"repeatCell": {
+        "range": {"sheetId": ws.id, "startRowIndex": 2, "endRowIndex": 3,
+                  "startColumnIndex": 1, "endColumnIndex": 2},
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}},
+        "fields": "userEnteredFormat.numberFormat"}}]})
     sheets_call(ws.batch_update,
                 [{"range": ref, "values": [[val]]}
                  for ref, val in dashboard_formulas(default_month)],
