@@ -65,10 +65,19 @@ oa_released / lc_received / packed / dispatched:
                      653,148.23 for Zipper against the FG Store dashboard's own
                      live call, 653,111.32 - 0.006% apart, the live call dropping
                      a 2022 orphan OA that the closing query still carries.
-                     One call per DAY, not one per range: asked for a range the
-                     method returns a row per (OA, item) touched anywhere in it
-                     and rounds each one, so a 23-day call comes back 1,519 short
-                     of the day-23 call. Only the single-day reading stitches.
+                     One call per DAY, not one per range - a range reading is
+                     not just unstitchable, it is wrong. Checked against the FG
+                     dashboard's own 1-22 Aug range: closing QTY agrees exactly,
+                     5,771,377 pcs, but its closing VALUE is 1,519.00 lower, and
+                     all of the difference is one line. OA032360 / C#3 CE, in on
+                     31 Jul, shipped out entirely inside the range and left a
+                     -0.02 pcs rounding crumb behind; over a range the method
+                     hands that line back as closing_value = MINUS its opening
+                     value, -1,519.00, for a crumb worth about nothing. Asked for
+                     a single day the same line closes at 0.00. So this series
+                     reads a touch HIGHER than the dashboard does, and is right
+                     to - any line that empties out inside the window drags the
+                     dashboard's range total down by its whole opening value.
   Production Pending manufacturing.order, oa_total_balance > 0, oa_id set,
                      state not in (closed, cancel, hold).  (running order.har)
                      Value = balance_qty * final_price.
