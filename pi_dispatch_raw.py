@@ -49,25 +49,47 @@ oa_released / lc_received / packed / dispatched:
                      Verified: row count, qty AND value match dispatched exactly
                      for both companies.
 
-  FG Store Balance   operation.details.retrive_data_from_operation_details - the
-                     FG Store dashboard's own call.  (Fg Store.har)
+  FG Store Balance   operation.details.retrieve_fg_store_datas, called once per
+                     day per company with date_from = date_to = that day.
+                     (FG closing.har)  QTY/Value = closing_qty/closing_value -
+                     what was still sitting in the store when that day ended.
+                     This is a DAY-BY-DAY series, not a snapshot: the closing
+                     row is a real historical balance, so the metric carries a
+                     number on every day of the month up to today.
+                     Verified against the two flows either side of it: the
+                     day-on-day MOVE in closing equals FG Packing less Dispatch
+                     on 22 of the month's 23 days to the cent, the 23rd being
+                     67 out of 20,300. The store fills by packing and empties by
+                     dispatch, and this series does exactly that.
+                     Verified against the snapshot too: 23 Aug closing
+                     653,148.23 for Zipper against the FG Store dashboard's own
+                     live call, 653,111.32 - 0.006% apart, the live call dropping
+                     a 2022 orphan OA that the closing query still carries.
+                     One call per DAY, not one per range: asked for a range the
+                     method returns a row per (OA, item) touched anywhere in it
+                     and rounds each one, so a 23-day call comes back 1,519 short
+                     of the day-23 call. Only the single-day reading stitches.
   Production Pending manufacturing.order, oa_total_balance > 0, oa_id set,
                      state not in (closed, cancel, hold).  (running order.har)
                      Value = balance_qty * final_price.
 
-The last two are BALANCES, not monthly flows: they are what is outstanding right
-now, including stock and orders older than this month, so they are NOT filtered
-to the month. Each such row is stamped with the run date so it lands on today's
-column in a date pivot; its own document date is kept in "Doc Date". Odoo keeps
-no history of either, so there is no honest way to spread them across the month -
-which is why FG Packing and Production Done exist: they are the dated events
-behind the same two stages, and they are what the day columns are for. On the dashboard
-the balance rows are blank on every day but the refresh day, so a row of 0.00
-never gets mistaken for missing data.
+Production Pending is the one BALANCE left, not a monthly flow: it is what is
+outstanding right now, including orders older than this month, so it is NOT
+filtered to the month. Its rows are stamped with the run date so they land on
+today's column in a date pivot; the document date is kept in "Doc Date". Odoo
+keeps no history of it, so there is no honest way to spread it across the month -
+which is why Production Done exists: it is the dated event behind the same stage,
+and it is what the day columns are for. On the dashboard the row is blank on
+every day but the refresh day, so a row of 0.00 never gets mistaken for missing
+data.
 
 operation.details and manufacturing.order carry no salesperson, so Sales Person
 (and Sales Team / Region where blank) is filled in from the linked sale.order via
-oa_id.
+oa_id. The closing rows carry no ids at all - only the OA's name - so they are
+joined to sale.order by name instead; every OA in the store matched on the month
+this was written. One legacy OA (OA400607, 18 pcs in since 2022) has no customer,
+team or salesperson on it, and a blank there would drop it out of the dashboard's
+"All" wildcard, so those three fields fall back to "(unassigned)".
 
 TABS WRITTEN
 
@@ -122,10 +144,13 @@ DASHBOARD_WORKSHEET = "Dashboard"
 LISTS_WORKSHEET = "Lists"
 # Stamped into Lists!L1. Bump it whenever the layout or a formula changes and the
 # next run replaces the built dashboard instead of leaving the stale one alone.
-DASHBOARD_VERSION = "3"
+DASHBOARD_VERSION = "4"
 
 COMPANY_IDS = [1, 3]
 COMPANY_NAMES = {1: "Zipper", 3: "Metal Trims"}
+# Stand-in for a dashboard criterion the source left empty, so the row still
+# falls inside the "All" wildcard instead of quietly dropping out of the totals.
+UNASSIGNED = "(unassigned)"
 DHAKA = timezone(timedelta(hours=6))
 
 # Metric labels, in the order the user's pivot template lists them.
@@ -138,8 +163,14 @@ M_DISPATCH = "Dispatch"
 M_FG = "FG Store Balance"
 M_PROD = "Production Pending"
 METRIC_ORDER = [M_PI, M_OA, M_LC, M_PRODUCTION, M_PACKING, M_DISPATCH, M_FG, M_PROD]
-# Snapshots rather than daily flows - they carry one date, the run date.
-BALANCE_METRICS = {M_FG, M_PROD}
+# A snapshot rather than a daily flow - it carries one date, the run date.
+# FG Store Balance used to be one too; retrieve_fg_store_datas gives it a real
+# per-day history, so it is a flow-shaped series now and is not in here.
+BALANCE_METRICS = {M_PROD}
+# A daily series of balances rather than of flows: it has a real number on every
+# day up to the last refresh, but 0.00 on the days after it would read as "the
+# store emptied" instead of "not yet", so the dashboard stops the row there.
+DAILY_BALANCE_METRICS = {M_FG}
 
 # label, kind. "id" columns are written as text so LC / invoice numbers keep
 # their leading zeros (set_with_dataframe writes USER_ENTERED).
@@ -341,18 +372,47 @@ def fetch_operations(next_operation, start, end):
                         "qty", "final_price", "state"])
 
 
-def fetch_fg_store():
-    """FG Store Balance - the dashboard's own call, keyed by OA id."""
-    result = call_kw("operation.details", "retrive_data_from_operation_details", [[]]) or {}
-    datas = result.get("datas") or {}
-    rows = []
-    for oa_id, group in datas.items():
-        for rec in (group or []):
-            rows.append((int(oa_id), rec))
-    rows.sort(key=lambda t: t[0])
-    rows = [rec for _, rec in rows if rec.get("company_id") in COMPANY_IDS]
-    log.info(f"  operation.details (FG store): {len(rows)} rows")
-    return rows
+def fetch_fg_closing(start, end):
+    """FG Store Balance, one day at a time. The method takes a date range and
+    hands back opening / received / delivery / disposal / closing per (OA, item);
+    asked for a single day, its closing IS that day's closing balance, which is
+    the only reading that stitches into a series (see the module docstring).
+
+    Company comes from the argument, not from the rows - they carry no company
+    at all, and asked for both at once the method merges a pair of them.
+
+    Rows that close at nothing are dropped: 5% of them, all of it stock that was
+    delivered out during the day, and they would add nothing but height."""
+    out = []
+    day = start
+    while day <= end:
+        for company_id in COMPANY_IDS:
+            recs = call_kw("operation.details", "retrieve_fg_store_datas",
+                           [[company_id], str(day), str(day)]) or []
+            kept = [r for r in recs
+                    if round2(r.get("closing_qty")) or round2(r.get("closing_value"))]
+            out += [(day, company_id, r) for r in kept]
+        day += timedelta(days=1)
+    log.info(f"  operation.details (FG closing): {len(out)} rows over "
+             f"{(end - start).days + 1} days")
+    return out
+
+
+def fetch_oa_by_name(names):
+    """The closing rows name their OA but carry no id, so the sale.order they
+    need for Sales Person / Team / Customer has to be looked up by name."""
+    names = sorted({clean_text(n) for n in names if n})
+    lookup = {}
+    for i in range(0, len(names), 500):
+        chunk = names[i:i + 500]
+        for rec in call_kw("sale.order", "search_read",
+                           [[["name", "in", chunk]],
+                            ["name", "user_id", "team_id", "region_id",
+                             "partner_id", "buyer_name", "lc_number",
+                             "order_ref"]], limit=0) or []:
+            lookup[clean_text(rec["name"])] = rec
+    log.info(f"  sale.order by name: {len(lookup)} of {len(names)} OAs matched")
+    return lookup
 
 
 MO_FIELDS = ["oa_id", "company_id", "partner_id", "buyer_name", "team_id",
@@ -502,26 +562,29 @@ def rows_operations(recs, metric, oa_lookup):
     return out
 
 
-def rows_fg_store(recs, as_of):
-    """Balance as of the run date - stock still sitting in the FG store."""
+def rows_fg_closing(daily, oa_lookup):
+    """Stock still in the FG store at the end of each day of the month."""
     out = []
-    for r in recs:
+    for day, company_id, r in daily:
+        oa = oa_lookup.get(clean_text(r.get("oa"))) or {}
         row = blank_row()
-        stamp(row, M_FG, as_of)
-        row["Company"] = clean_text(r.get("company_name")) or COMPANY_NAMES.get(r.get("company_id"), "")
-        row["Sales Team"] = clean_text(r.get("sales_team"))
-        row["Sales Person"] = clean_text(r.get("sales_person_name"))
-        row["Region"] = clean_text(r.get("region_name"))
-        row["Customer"] = clean_text(r.get("customer_name"))
-        row["Buyer"] = clean_text(r.get("buyer_name"))
-        row["PI No"] = clean_text(r.get("pi"))
-        row["OA No"] = clean_text(r.get("oa_name"))
-        row["Invoice No"] = clean_text(r.get("invoice_number"))
-        row["LC No"] = clean_text(r.get("lc_number"))
-        row["Item"] = clean_text(r.get("fg_categ_type"))
-        row["Doc Date"] = clean_date(r.get("goods_in_date"))
-        row["QTY"] = round2(r.get("stock_qty"))
-        row["Value"] = round2(r.get("stock_value"))
+        stamp(row, M_FG, day)
+        row["Company"] = COMPANY_NAMES.get(company_id, "")
+        # The three dashboard criteria that must never be blank - one 2022 OA
+        # has none of them, and a blank would fall outside the "All" wildcard.
+        row["Sales Team"] = m2o_name(oa.get("team_id")) or UNASSIGNED
+        row["Sales Person"] = m2o_name(oa.get("user_id")) or UNASSIGNED
+        row["Customer"] = m2o_name(oa.get("partner_id")) or UNASSIGNED
+        row["Region"] = m2o_name(oa.get("region_id"))
+        row["Buyer"] = m2o_name(oa.get("buyer_name"))
+        row["PI No"] = m2o_name(oa.get("order_ref"))
+        row["OA No"] = clean_text(r.get("oa"))
+        row["LC No"] = clean_text(oa.get("lc_number"))
+        row["Item"] = clean_text(r.get("item"))
+        row["Doc Date"] = clean_date(r.get("in_date"))
+        row["QTY"] = round2(r.get("closing_qty"))
+        row["Value"] = round2(r.get("closing_value"))
+        row["Status"] = clean_text(r.get("lc_status"))
         out.append(row)
     return out
 
@@ -574,8 +637,11 @@ def build(as_of):
     log.info("Fetching Dispatch ...")
     deliveries = fetch_operations("Delivery", start, end)
 
-    log.info("Fetching FG Store Balance ...")
-    fg = fetch_fg_store()
+    log.info("Fetching FG Store Balance, day by day ...")
+    # Only up to today: the closing balance for a day that has not happened yet
+    # would just repeat today's and put a flat line across the rest of the month.
+    fg_daily = fetch_fg_closing(start, min(end, as_of))
+    fg_oas = fetch_oa_by_name([r.get("oa") for _, _, r in fg_daily])
 
     log.info("Fetching Production Pending ...")
     running = fetch_running_orders()
@@ -595,7 +661,7 @@ def build(as_of):
                                  day_field="closing_date")
             + rows_operations(packings, M_PACKING, oa_lookup)
             + rows_operations(deliveries, M_DISPATCH, oa_lookup)
-            + rows_fg_store(fg, as_of)
+            + rows_fg_closing(fg_daily, fg_oas)
             + rows_manufacturing(running, oa_lookup, M_PROD, "balance_qty", as_of=as_of))
 
     df = pd.DataFrame(rows, columns=LABELS)
@@ -821,6 +887,11 @@ def dashboard_formulas(default_month):
             parts += ['Raw!' + rng + ',IF(' + sel + '="All","*",' + sel + ')'
                       for rng, sel in criteria]
             body = 'SUMIFS(' + ",".join(parts) + ')'
+            if metric in DAILY_BALANCE_METRICS:
+                # Blank the days past the last one Raw holds - a flow is
+                # honestly 0 before it happens, a balance is simply unknown.
+                body = ('IF(' + head + '>MAXIFS(Raw!$B$2:$B,Raw!$A$2:$A,$A'
+                        + str(row) + '),"",' + body + ')')
             if metric in BALANCE_METRICS:
                 # A balance carries a single date - the last refresh - so every
                 # other day would read 0.00 and be taken for missing data. Blank
@@ -830,18 +901,29 @@ def dashboard_formulas(default_month):
                         + str(row) + '),"",' + body + ')')
             cells.append((a1_col(col) + str(row),
                           '=IF(' + head + '="","",' + body + ')'))
+        span = (a1_col(FIRST_DAY_COL) + str(row) + ':'
+                + a1_col(LAST_DAY_COL) + str(row))
+        if metric in DAILY_BALANCE_METRICS:
+            # Adding up 31 closing balances would count the same stock 31 times.
+            # The month's total for a balance is the last day that has one -
+            # LOOKUP(2,1/...) is the idiom for "last non-blank in the row".
+            total = 'IFERROR(LOOKUP(2,1/(' + span + '<>""),' + span + '),"")'
+        else:
+            total = 'SUM(' + span + ')'
         cells.append((a1_col(TOTAL_COL) + str(row),
-                      '=IF($B$3="","",SUM(' + a1_col(FIRST_DAY_COL) + str(row)
-                      + ':' + a1_col(LAST_DAY_COL) + str(row) + '))'))
+                      '=IF($B$3="","",' + total + ')'))
 
     note_row = FIRST_METRIC_ROW + len(METRIC_ORDER) + 1
     cells.append(("A" + str(note_row),
                   "The first six rows are daily flows - what happened on each "
-                  "day. FG Store Balance and Production Pending are balances as "
-                  "of the last refresh, so they carry a number on the refresh day "
-                  "only and stay blank on every other day; for the day-by-day "
-                  "version of those two stages read FG Packing (into the store) "
-                  "and Production Done (orders finished in the factory)."))
+                  "day. FG Store Balance is a daily closing balance: what was "
+                  "still in the store when that day ended, so it does not add up "
+                  "across days and its Total column shows the last day's "
+                  "closing instead of a sum. Production Pending "
+                  "is a balance as of the last refresh, so it carries a number "
+                  "on the refresh day only and stays blank on every other day; "
+                  "for the day-by-day version of that stage read Production Done "
+                  "(orders finished in the factory)."))
     return cells
 
 
@@ -904,7 +986,7 @@ def ensure_dashboard(sheet, default_month):
     sid = ws.id
     last_metric_row = FIRST_METRIC_ROW + len(METRIC_ORDER)
     balance_rows = [FIRST_METRIC_ROW + i for i, m in enumerate(METRIC_ORDER)
-                    if m in BALANCE_METRICS]
+                    if m in BALANCE_METRICS or m in DAILY_BALANCE_METRICS]
     reqs = []
     for row, _, source, _ in SELECTORS:
         reqs.append({"setDataValidation": {
@@ -977,7 +1059,8 @@ def ensure_dashboard(sheet, default_month):
                 "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}},
             "fields": "userEnteredFormat.numberFormat"}},
         # Italic on the balance rows: they are read differently from the flows
-        # above them, and a mostly-blank row wants a reason on the face of it.
+        # above them - neither one adds up across the days, and Production
+        # Pending is mostly blank besides.
         {"repeatCell": {
             "range": {"sheetId": sid,
                       "startRowIndex": min(balance_rows) - 1,
