@@ -4,15 +4,17 @@ FG Stock report -> Google Sheets.
 Source: operation.details.retrive_data_from_operation_details([[]]), the call the
 Odoo FG Store dashboard makes (captured in FG report.har, action 2591).
 
-Six tabs, laid out to match "Fg_Stock AS ON 15-08-2026 (1).xlsx":
+Seven tabs, laid out to match "Fg_Stock AS ON 15-08-2026 (1).xlsx":
 
   FG Stock                     the dashboard's Excel-export layout (Fg_Stock.xlsx):
                                33 columns, Total row, sorted ascending by oa_id,
-                               plus the five derived columns below.
+                               plus the five derived columns below and FG Remarks.
   Full Goods Ready LC RCV      \\
   Partially ready LC RCV        |  the 2x2 split on LC Status x FG Status, each
   Full Goods Ready LC Pending   |  with a banner and a subtotal row, 19 columns.
   Partially ready LC Pending   /
+  FG Remarks                   only the OAs whose Odoo FG Remarks field is set,
+                               grouped by remark with a subtotal per group.
   SUMMERY                      TWO stacked pivots of Stock Value by LC/FG status,
                                one per ageing scale: delivery-date ageing on top
                                (rows 2-12, with a "Delivery not due" column) and
@@ -38,6 +40,10 @@ reproduce every row of both with zero mismatches:
              SUMMERY's first pivot uses this; its second uses Ageing.
 
 Both ageing scales use the same bands: <=5 / <=10 / <=20 / <=30 / <=60 / <=90 / >90.
+
+FG Remarks is a free-standing note the commercial team sets on the OA in Odoo
+(fg_remarks). It is not part of the dashboard's Excel export, so it is appended
+after the derived columns rather than slotted into the verbatim 33.
 
 Four defects in the source Excel export are deliberately NOT reproduced - see
 EXPORT_FIXES.
@@ -81,6 +87,7 @@ PASSWORD = os.getenv("ODOO_PASSWORD")
 SHEET_KEY = "1YRLVLKbrwXIziBAmtAzgEfEPH64Ycwu57ZZJrDO6aks"
 MASTER_WORKSHEET = "FG Stock"
 SUMMARY_WORKSHEET = "SUMMERY"
+REMARKS_WORKSHEET = "FG Remarks"
 
 # Tabs from earlier revisions of this script, superseded by the ones above.
 OBSOLETE_WORKSHEETS = [
@@ -145,6 +152,7 @@ COLUMNS = [
     ("Ageing",          None,                "text"),
     ("LC Status",       None,                "text"),
     ("FG Status",       None,                "text"),
+    ("FG Remarks",      "fg_remarks",        "text"),
 ]
 LABELS = [label for label, _, _ in COLUMNS]
 KIND = {label: kind for label, _, kind in COLUMNS}
@@ -159,6 +167,10 @@ CATEGORY_LABELS = [
 ]
 # Columns carried in each category tab's subtotal row, as in the workbook.
 SUBTOTAL_LABELS = ["Pending QTY", "Pending Value", "Stock QTY", "Stock Value"]
+
+# The FG Remarks tab: the same 19 columns, led by the remark so the groups read
+# down column A, and with the two status columns kept for context.
+REMARKS_LABELS = ["FG Remarks"] + CATEGORY_LABELS
 
 # worksheet title, LC Status, FG Status, banner, "Kindly attention". Text verbatim
 # from the workbook.
@@ -376,6 +388,34 @@ def build_category(master_df, lc_status, fg_status):
     return sel[CATEGORY_LABELS].reset_index(drop=True)
 
 
+def build_remarks(master_df):
+    """Every OA carrying an FG Remark, grouped by remark and oldest stock first,
+    with a subtotal row closing each group.
+
+    Returns the frame and the 0-based positions of its subtotal rows, which
+    push_remarks turns into sheet rows to bold."""
+    body = master_df.iloc[1:]
+    sel = body[body["FG Remarks"] != ""]
+
+    rows, subtotal_at = [], []
+    for remark in sorted(sel["FG Remarks"].unique()):
+        grp = (sel[sel["FG Remarks"] == remark]
+               .sort_values("Age", ascending=False, kind="stable"))
+        rows.extend(grp[REMARKS_LABELS].to_dict("records"))
+        sub = {label: "" for label in REMARKS_LABELS}
+        sub["FG Remarks"] = f"{remark} Total"
+        for label in SUBTOTAL_LABELS:
+            sub[label] = round2(subtotal(grp, label))
+        subtotal_at.append(len(rows))
+        rows.append(sub)
+
+    return pd.DataFrame(rows, columns=REMARKS_LABELS), subtotal_at
+
+
+def subtotal(df, label):
+    return pd.to_numeric(df[label], errors="coerce").fillna(0).sum()
+
+
 def build_summary_table(master_df, tab_gids, ageing_col, buckets):
     """Stock Value by LC Status / FG Status against one ageing scale."""
     body = master_df.iloc[1:]
@@ -549,11 +589,29 @@ def push_category(sheet, title, df, banner):
     """Banner on row 1, subtotals on row 2, headers on row 3, data from row 4."""
     sub = [""] * len(CATEGORY_LABELS)
     for label in SUBTOTAL_LABELS:
-        sub[CATEGORY_LABELS.index(label)] = round2(
-            pd.to_numeric(df[label], errors="coerce").fillna(0).sum())
+        sub[CATEGORY_LABELS.index(label)] = round2(subtotal(df, label))
     return push(sheet, title, df, KIND, header_row=3,
                 pre_cells=[("A1", [[banner]]), ("A2", [sub])],
                 bold_rows=(1, 2), freeze=3)
+
+
+def push_remarks(sheet, df, subtotal_at, as_of):
+    """Same shape as a category tab - banner, grand subtotal, headers on row 3 -
+    with each remark group's own subtotal bolded in place."""
+    body = df.drop(index=subtotal_at)   # the per-group subtotal rows
+    sub = [""] * len(REMARKS_LABELS)
+    sub[0] = "Total"
+    for label in SUBTOTAL_LABELS:
+        sub[REMARKS_LABELS.index(label)] = round2(subtotal(body, label))
+
+    banner = (f"FG Remarks raised in Odoo, as on {as_of.day} {as_of:%B %Y}"
+              f" - {len(body)} OA(s)")
+    header_row = 3
+    # data starts on header_row + 1, so frame position p lands on that row + p
+    bold = (1, 2) + tuple(header_row + 1 + p for p in subtotal_at)
+    return push(sheet, REMARKS_WORKSHEET, df, KIND, header_row=header_row,
+                pre_cells=[("A1", [[banner]]), ("A2", [sub])],
+                bold_rows=bold, freeze=3)
 
 
 def push_summary(sheet, dfs, as_of):
@@ -604,6 +662,7 @@ def main():
 
     categories = [(title, banner, build_category(master, lc, fg))
                   for title, lc, fg, banner, _ in CATEGORIES]
+    remarks, remark_subtotals = build_remarks(master)
 
     totals = master.iloc[0]
     log.info("Totals: " + "  ".join(
@@ -614,6 +673,10 @@ def main():
         f"{c}={(body['Ageing DD'] == c).sum()}" for c in AGEING_ORDER + [NOT_DUE]))
     log.info("Ageing:    " + "  ".join(
         f"{c}={(body['Ageing'] == c).sum()}" for c in AGEING_ORDER))
+    flagged = body[body["FG Remarks"] != ""]
+    log.info(f"FG Remarks: {len(flagged)} of {len(body)} rows flagged  "
+             + "  ".join(f"{r}={n}" for r, n in
+                         flagged["FG Remarks"].value_counts().items()))
 
     covered = sum(len(d) for _, _, d in categories)
     if covered != len(body):
@@ -627,9 +690,10 @@ def main():
         master.to_csv(out, index=False)
         for title, _, d in categories:
             d.to_csv(out.replace(".csv", f" - {title}.csv"), index=False)
+        remarks.to_csv(out.replace(".csv", f" - {REMARKS_WORKSHEET}.csv"), index=False)
         for (suffix, _, _), s in zip(SUMMARY_TABLES, build_summaries(master, {})):
             s.to_csv(out.replace(".csv", f" - SUMMERY ({suffix}).csv"), index=False)
-        log.info(f"DRY RUN: wrote {out} and 6 companions, skipped Google Sheets")
+        log.info(f"DRY RUN: wrote {out} and 7 companions, skipped Google Sheets")
         return
 
     client = get_gspread_client()
@@ -640,6 +704,7 @@ def main():
     tab_gids = {}
     for title, banner, d in categories:
         tab_gids[title] = push_category(sheet, title, d, banner).id
+    push_remarks(sheet, remarks, remark_subtotals, as_of)
     push_summary(sheet, build_summaries(master, tab_gids), as_of)
     # Drop last: the tabs just written guarantee the spreadsheet still has a
     # sheet left, so no delete can hit the last-tab guard.
